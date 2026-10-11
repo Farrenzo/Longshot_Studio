@@ -844,11 +844,11 @@ function pickFields(o, keys) {
 }
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
-  omit = null, trimLeft = false, takeClips = null, chunk = null }) {
+  omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
-  const missing = kind === "clips" ? [] : missingRefs();
+  const missing = kind === "clips" || kind === "export" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
     render();
@@ -892,7 +892,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     // gets a new take is decoded on its own into its clip (Long Shot 1.6).
     const clipsFor = !dry && (kind === "render" || kind === "reroll")
       ? project.shots.filter((x) => !x.bypassed && x.kind !== "clip" && !x.lock).map((x) => x.id) : null;
-    const body = takeClips ? { project, take_clips: takeClips }
+    const body = takeClips ? { project, take_clips: takeClips } : exportClips ? { project, export_clips: exportClips }
       : { project, upto, dry_run: !!dry, final, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
   } catch (e) {
@@ -916,7 +916,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   const sent = {};
   for (const sh of project.shots) sent[sh.id] = { text: sh.text || "", seconds: Number(sh.seconds) };
   S.busy = {
-    promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone,
+    promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone, extra,
     of: built.chain.length, segs: {}, segT0: {}, step: 0, phase: "queued", started: Date.now(),
   };
   if (kind === "render" || kind === "reroll") S.open = target;
@@ -983,6 +983,9 @@ async function finish(promptId, entry) {
     S.error = "The render finished but ComfyUI's history has no record of it.";
   } else if (b.kind === "clips") {
     await adoptClips(Object.entries(b.built.nodes.clips || {}).map(([key, node]) => ({ key, node })), entry.outputs || {});
+    if (S.exportAfter) { S.exportAfter = false; setTimeout(exportApproved, 0); }
+  } else if (b.kind === "export") {
+    await exportDone(b, entry.outputs || {});
   } else {
     const outputs = entry.outputs || {};
     let ls = outputs[b.built.nodes.longshot] || {};
@@ -1544,6 +1547,77 @@ function ensureClips() {
   const need = active().filter((s) => s.kind !== "clip" && isRendered(s) && s.take &&
     !S.clips[takeStem(s.take)] && !S.clipTried.has(s.take)).map((s) => ({ take: s.take }));
   if (need.length) makeClips(need);
+}
+
+// ---------------------------------------------------------------------------
+// Export approved clips: each approved Shot's own clip, whole (nothing hidden
+// at the joins), numbered as on the timeline, into <project>/Approved_Clips
+// ---------------------------------------------------------------------------
+
+function seedOfTake(s) {
+  const m = /__(\d+)__/.exec(s.take || "");
+  return m ? m[1] : Number(s.shot_seed) >= 0 ? String(s.shot_seed) : "auto";
+}
+
+function approvedForExport() {
+  const act = active(), width = Math.max(2, String(act.length).length);
+  return act.filter((s) => s.kind !== "clip" && s.status === "approved" && s.take).map((s) => ({
+    s, key: takeStem(s.take), take: s.take,
+    name: `Shot ${String(numOf(s.id)).padStart(width, "0")} – seed ${seedOfTake(s)}`,
+  }));
+}
+
+function exportedToast(r, skipped) {
+  const n = (r.files || []).filter((f) => /\.mp4$/i.test(f)).length;
+  const mov = (r.files || []).length - n;
+  toast(`Exported ${n} approved clip${n === 1 ? "" : "s"}${mov ? ` (+${mov} ProRes)` : ""} to Approved_Clips.` +
+    (skipped ? ` ${skipped} Shot${skipped === 1 ? " isn't" : "s aren't"} approved yet and ${skipped === 1 ? "was" : "were"} left out.` : ""),
+    S.local ? { label: "Open folder", fn: () => api("/longshot/open-folder", { method: "POST",
+      body: { which: "output", project: P().slug, subfolder: r.subfolder } }).catch((e) => toast(e.message)) } : undefined);
+}
+
+async function exportApproved() {
+  if (!P() || busyGuard()) return;
+  const items = approvedForExport();
+  if (!items.length) { toast("No approved Shots to export yet."); return; }
+  const skipped = active().filter((s) => s.kind !== "clip" && s.status !== "approved").length;
+  if (P().settings.export_upscale) {
+    const v = P().settings.rtx_vsr || {};
+    queue({ kind: "export", exportClips: items.map((x) => ({ take: x.take })),
+      label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}`,
+      note: "Each approved take decoded on its own, whole, and upscaled a frame at a time",
+      extra: { items: items.map((x) => ({ name: x.name })), skipped }, onDone: () => {} });
+    return;
+  }
+  const missing = items.filter((x) => !S.clips[x.key]);
+  if (missing.length) {
+    S.exportAfter = true;
+    toast(`Making ${missing.length} clip${missing.length === 1 ? "" : "s"} first…`);
+    missing.forEach((x) => S.clipTried.delete(x.take));
+    await makeClips(missing.map((x) => ({ take: x.take })));
+    if (!S.busy) S.exportAfter = false;
+    return;
+  }
+  try {
+    const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST",
+      body: { mode: "copy", items: items.map((x) => ({ key: x.key, name: x.name })) } });
+    exportedToast(r, skipped);
+  } catch (e) { toast("Export failed: " + e.message); }
+}
+
+async function exportDone(b, outputs) {
+  const ex = b.built.nodes.export || {};
+  const items = (b.extra.items || []).map((it, i) => {
+    const nd = ex[String(i + 1)] || {};
+    const ui = outputs[nd.video] || {};
+    return { name: it.name, video: (ui.chunk_video || [])[0] || null, master: (ui.chunk_master || [])[0] || null,
+      audio: ((outputs[nd.audio] || {}).longshot_audio || [])[0] || null };
+  });
+  if (items.some((x) => !x.video)) { S.error = "The export saved no file. Update H3 Long Shot to 1.6.6 or later."; return; }
+  try {
+    const r = await api(`/longshot/approved/${encodeURIComponent(P().slug)}`, { method: "POST", body: { mode: "mux", items } });
+    exportedToast(r, b.extra.skipped);
+  } catch (e) { S.error = "Finishing the export failed: " + e.message; }
 }
 
 /** Takes in Take history without a clip (made before 0.6.5). */
@@ -2243,6 +2317,13 @@ function renderViewer() {
   $("tl-make").hidden = !older;
   $("tl-make").textContent = `Make clips for ${older} older take${older === 1 ? "" : "s"}`;
   $("tl-make").disabled = off || S.conn !== "ok";
+  const nApproved = active().filter((s) => s.kind !== "clip" && s.status === "approved" && s.take).length;
+  $("tl-export").hidden = !nApproved;
+  $("tl-export-btn").textContent = `Export ${nApproved} approved clip${nApproved === 1 ? "" : "s"}`;
+  $("tl-export-btn").disabled = off || S.conn !== "ok";
+  const vsrOk = !S.opts || !S.opts.nodes || S.opts.nodes.RTXVideoSuperResolution !== false;
+  $("tl-export-up").checked = vsrOk && !!P().settings.export_upscale;
+  $("tl-export-up").disabled = !vsrOk || off;
   // loop band + note
   const L = loopRange();
   const band = $("loop-band"), note = $("loop-note");
@@ -2903,6 +2984,7 @@ document.addEventListener("click", async (e) => {
     case "make-clips": makeClips(takesWithoutClips()); break;
     case "clear-all": clearAll(); break;
     case "open-folder": openFolder(el.dataset.which); break;
+    case "export-approved": exportApproved(); break;
     case "menu": toggleMenu(); break;
     case "new-project": closeMenu(); newProject(); break;
     case "open-list": closeMenu(); openList(); break;
@@ -2966,6 +3048,7 @@ document.addEventListener("change", async (e) => {
   const changed = before === undefined || before !== el.value;
   committed.set(el, el.value);
   if (el.dataset.relink) { relinkFromSelect(el); return; }
+  if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; return commit(); }
   if (el.dataset.baseSeed !== undefined) { changeBaseSeed(el); return; }
   if (el.dataset.multi !== undefined) {   // takes per render: nothing re-renders
     p.settings.multi_take = Math.max(1, Math.min(MULTI_MAX, Math.round(Number(el.value)) || 1));
@@ -3977,9 +4060,47 @@ async function toggleFullscreen() {
   } catch (e) { toast("Full screen isn't available here."); }
 }
 
+// Full screen: the bar shows while the mouse is near the bottom (or over the bar,
+// dragging the scrubber, or a control has the keyboard focus) and hides shortly
+// after it leaves; the cursor hides after a moment without moving.
+const FS = { hideT: null, idleT: null, y: null };
+const fsOn = () => document.fullscreenElement === $("stage");
+function fsShow(on) {
+  $("stage").classList.toggle("fs-hide", !on);
+}
+function fsKeep() {
+  const st = $("stage"), a = document.activeElement;
+  const barTop = window.innerHeight - (parseFloat(st.style.getPropertyValue("--bar-h")) || 160) - 40;
+  return pointerHeld || (FS.y !== null && FS.y >= barTop) ||
+    (a && a !== document.body && st.contains(a) && a.matches(":focus-visible")) ||
+    !$("confirm").hidden;
+}
+function fsCheck(delay = 700) {
+  clearTimeout(FS.hideT);
+  if (!fsOn()) return;
+  if (fsKeep()) { fsShow(true); return; }
+  FS.hideT = setTimeout(() => { if (fsOn() && !fsKeep()) fsShow(false); }, delay);
+}
+$("stage").addEventListener("mousemove", (e) => {
+  if (!fsOn()) return;
+  FS.y = e.clientY;
+  const st = $("stage");
+  st.classList.remove("fs-idle");
+  clearTimeout(FS.idleT);
+  FS.idleT = setTimeout(() => { if (fsOn() && !fsKeep()) st.classList.add("fs-idle"); }, 2000);
+  fsCheck();
+});
+$("stage").addEventListener("mouseleave", () => { FS.y = null; fsCheck(); });
+$("stage").addEventListener("focusin", () => fsCheck());
+document.addEventListener("pointerup", () => setTimeout(() => fsCheck(), 0), true);
+
 document.addEventListener("fullscreenchange", () => {
   const on = document.fullscreenElement === $("stage");
   $("fs-btn").setAttribute("aria-pressed", on);
+  const st = $("stage");
+  clearTimeout(FS.hideT); clearTimeout(FS.idleT);
+  st.classList.remove("fs-hide", "fs-idle");
+  if (on) { FS.y = null; FS.hideT = setTimeout(() => { if (fsOn() && !fsKeep()) fsShow(false); }, 2000); }
   // toasts and confirmations must live inside the full-screen element to be seen
   (on ? $("stage") : document.querySelector(".app")).appendChild($("toast"));
   layoutStage();
@@ -3987,10 +4108,9 @@ document.addEventListener("fullscreenchange", () => {
 window.addEventListener("resize", () => layoutStage());
 video.addEventListener("loadedmetadata", () => layoutStage());
 
-/** Full screen: the video takes the whole screen; controls and the decision
- *  panel sit in a translucent bar at the bottom. The picture goes up into the
- *  top of the screen only as far as it must, so letterbox space sits under the
- *  bar first and the bar covers as little of the frame as possible. */
+/** Full screen: the video takes the whole screen, centred; controls and the
+ *  decision panel sit in a translucent bar at the bottom that hides until the
+ *  mouse comes to the bottom of the screen (fsBar below). */
 function layoutStage() {
   const st = $("stage");
   const lo = P() && last();
@@ -4005,7 +4125,7 @@ function layoutStage() {
   st.style.setProperty("--bar-h", barH + "px");
   st.style.setProperty("--dec-h", dec.offsetHeight + "px");
   const fitH = Math.min(H, W / ar);
-  const top = H - fitH >= barH ? (H - barH - fitH) / 2 : 0;
+  const top = (H - fitH) / 2;                    // centred: the bar hides until the mouse comes down
   st.style.setProperty("--vid-top", top + "px");
   st.style.setProperty("--vid-h", fitH + "px");
 }

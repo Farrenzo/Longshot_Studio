@@ -341,6 +341,56 @@ def build_take_clips(project: dict, takes: list, env: Env | None = None) -> Buil
                  filename_prefix=clips_subfolder(project), video_format=fmt, warnings=warnings)
 
 
+def build_clip_export(project: dict, items: list, env: Env | None = None) -> Build:
+    """Export approved clips, upscaled: [{take, n}] -> one branch each. The take
+    is decoded on its own, whole (MiniMax H3 Take -> VAE Decode), upscaled a
+    frame at a time straight into a file (MiniMax H3 Upscale Chunk) and its sound
+    saved as a WAV, into Approved_Clips/_work; the server then adds the sound.
+    The project's ProRes master setting also makes a ProRes copy of each clip."""
+    env = env or Env()
+    s = project.get("settings") or {}
+    need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "MiniMaxH3UpscaleChunk",
+            "MiniMaxH3SaveAudio", "RTXVideoSuperResolution"]
+    missing = [c for c in need if not env.has(c)]
+    if missing:
+        raise BuildError("ComfyUI is missing node(s) this needs:\n  " +
+                         "\n  ".join(f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing))
+    for key in ("video_vae", "audio_vae"):
+        if not s.get(key):
+            raise BuildError(f"Settings: choose a {key.replace('_', ' ')} file.")
+    vsr = s.get("rtx_vsr") or {}
+    quality = vsr.get("quality", "ULTRA")
+    if quality not in VSR_QUALITIES:
+        raise BuildError(f"RTX Super Resolution quality must be one of {', '.join(VSR_QUALITIES)}.")
+    scale = _num(vsr.get("scale", 2.0), "RTX upscale factor", 1, 4)
+    warnings = []
+    fmt = _video_format(env, warnings)
+    work = f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/Approved_Clips/_work"
+    g = _Graph()
+    vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
+    avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    out = {}
+    for n, it in enumerate(items or [], 1):
+        take = str((it or {}).get("take") or "")
+        if not TAKE_NAME_RE.fullmatch(take):
+            raise BuildError(f"Not a take: {take!r}")
+        lat = g.add(f"take{n}", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project),
+                    take=take, shot_id="")
+        images = g.add(f"dec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae)
+        audio = g.add(f"aud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+        g.add(f"up{n}", "MiniMaxH3UpscaleChunk", f"Upscale clip {n}", images=images, start=0,
+              length=10_000_000, scale=scale, quality=quality, filename_prefix=f"{work}/c{n:03d}",
+              codec="h264_nvenc" if fmt == NVENC else "libx264",
+              master_prefix=f"{work}/c{n:03d}_master" if s.get("prores_master") else "", frame_rate=float(FPS))
+        g.add(f"wav{n}", "MiniMaxH3SaveAudio", f"Sound of clip {n}", audio=audio,
+              filename_prefix=f"{work}/c{n:03d}_audio")
+        out[str(n)] = {"video": f"up{n}", "audio": f"wav{n}"}
+    if not out:
+        raise BuildError("No approved Shots to export.")
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"export": out},
+                 filename_prefix=work, video_format=fmt, warnings=warnings)
+
+
 def required_classes(project: dict, dry_run: bool = False, final: bool = False) -> list:
     """Node classes the build will use, given the project's toggles."""
     s = project.get("settings") or {}

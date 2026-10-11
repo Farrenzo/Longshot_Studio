@@ -132,6 +132,10 @@
           · <button class="linkbtn" data-action="update-preview" id="tl-update" title="Decode every rendered Shot together for the exact video. Nothing is sampled.">Update preview</button>
           <button class="linkbtn" data-action="make-clips" id="tl-make" hidden title="Takes in Take history that have no clip yet: decode each on its own (nothing is sampled)."></button>
         </div>
+        <div id="tl-export" class="tl-approx tl-export" hidden>
+          <button class="linkbtn" data-action="export-approved" id="tl-export-btn" title="Copy each approved Shot's own clip (whole, with sound) into output/longshot/&lt;project&gt;/Approved_Clips, numbered as on the timeline. Nothing is decoded.">Export approved clips</button>
+          <label class="export-up" title="Decode each approved take again on its own and upscale it with RTX Super Resolution (scale and quality from Settings; the ProRes master setting adds a .mov of each)."><input type="checkbox" id="tl-export-up"> Upscale with RTX</label>
+        </div>
       </div>
       <div class="controls">
         <button class="ctl icon-ctl" id="play" data-action="play" aria-label="Play">

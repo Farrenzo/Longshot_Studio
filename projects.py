@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.6.13"
+STUDIO_VERSION = "0.6.15"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -615,7 +615,9 @@ def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmp
         tmp = os.path.join(chunks_folder(output_dir, slug), "joining_" + out_name)
         cmd = [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing]
         if wav:
-            cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", *audio_codec, "-shortest"]
+            # the sound is padded with silence and cut at the picture's end: every frame stays
+            cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-af", "apad", "-c:a", *audio_codec,
+                    "-shortest"]
         else:
             cmd += ["-map", "0:v:0", "-c", "copy"]
         cmd += [*extra, tmp]
@@ -633,6 +635,124 @@ def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmp
     master = one(mast, f"{stem}_master_{n:05d}-audio.mov", ["pcm_s24le"], []) if mast else None
     discard_chunks(output_dir, slug)
     return {"video": video, "master": master}
+
+
+# ---------------------------------------------------------------------------
+# Export approved clips: each approved Shot's own clip, whole, numbered as on
+# the timeline, in output/longshot/<slug>/Approved_Clips (for an editor)
+# ---------------------------------------------------------------------------
+
+APPROVED_DIR = "Approved_Clips"
+_WORK_DIR = "_work"
+_CLIP_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,160}")
+
+
+def approved_folder(output_dir, slug):
+    return os.path.join(output_dir, "longshot", slug, APPROVED_DIR)
+
+
+def approved_subfolder(slug):
+    return f"longshot/{slug}/{APPROVED_DIR}"
+
+
+def clear_approved(output_dir, slug, keep_work=False):
+    """Empty Approved_Clips of its videos (and the upscale's work files)."""
+    folder = approved_folder(output_dir, slug)
+    if not is_slug(slug) or not os.path.isdir(folder):
+        return 0
+    n = 0
+    for f in os.listdir(folder):
+        path = os.path.join(folder, f)
+        if os.path.isfile(path) and f.lower().endswith((".mp4", ".mov")):
+            os.remove(path)
+            n += 1
+    if not keep_work:
+        shutil.rmtree(os.path.join(folder, _WORK_DIR), ignore_errors=True)
+    return n
+
+
+def _export_name(name, ext):
+    out = f"{name}{ext}"
+    if not _plain_file_name(out):
+        raise ValueError(f"Not a usable file name: {name!r}")
+    return out
+
+
+def copy_approved(output_dir, slug, items):
+    """[{key, name}] -> clips/<key>.mp4 copied as Approved_Clips/<name>.mp4
+    (the folder is emptied first, so it matches the timeline). Returns the names."""
+    if not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    plan = []
+    for it in items or []:
+        key = str((it or {}).get("key") or "")
+        if not _CLIP_KEY_RE.fullmatch(key):
+            raise ValueError(f"Not a clip: {key!r}")
+        src = os.path.join(clips_folder(output_dir, slug), key + ".mp4")
+        if not os.path.isfile(src):
+            raise ValueError(f"The clip for {it.get('name') or key} isn't there yet.")
+        plan.append((src, _export_name(str(it.get("name") or ""), ".mp4")))
+    if not plan:
+        raise ValueError("No approved clips to export.")
+    folder = approved_folder(output_dir, slug)
+    os.makedirs(folder, exist_ok=True)
+    clear_approved(output_dir, slug)
+    for src, name in plan:
+        shutil.copy2(src, os.path.join(folder, name))
+    return [name for _, name in plan]
+
+
+def _work_path(output_dir, slug, entry):
+    if not isinstance(entry, dict):
+        raise ValueError("A work file is {filename, subfolder}.")
+    name, sub = entry.get("filename"), (entry.get("subfolder") or "").replace("\\", "/").strip("/")
+    if sub != f"{approved_subfolder(slug)}/{_WORK_DIR}" or not _plain_file_name(name) \
+            or not _CHUNK_EXT_RE.fullmatch(name):
+        raise ValueError(f"Not an export work file: {sub}/{name}")
+    path = os.path.join(approved_folder(output_dir, slug), _WORK_DIR, name)
+    if not os.path.isfile(path):
+        raise ValueError(f"{name} is missing.")
+    return path
+
+
+def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None):
+    """The upscaled export: [{name, video, audio, master}] (work files the
+    Upscale Chunk / Save Audio nodes wrote) -> Approved_Clips/<name>.mp4 (and
+    <name>.mov with the ProRes copy), pictures copied, sound added. The folder
+    is emptied first and the work files are removed afterwards."""
+    import subprocess
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=900))
+    if not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    plan = []
+    for it in items or []:
+        name = str((it or {}).get("name") or "")
+        _export_name(name, ".mp4")
+        plan.append((name, _work_path(output_dir, slug, it.get("video")),
+                     _work_path(output_dir, slug, it["audio"]) if it.get("audio") else None,
+                     _work_path(output_dir, slug, it["master"]) if it.get("master") else None))
+    if not plan:
+        raise ValueError("No approved clips to export.")
+    folder = approved_folder(output_dir, slug)
+    clear_approved(output_dir, slug, keep_work=True)
+    out = []
+    for name, video, wav, master in plan:
+        for src, ext, acodec, extra in ((video, ".mp4", ["aac", "-b:a", "256k"], ["-movflags", "+faststart"]),
+                                        (master, ".mov", ["pcm_s24le"], [])):
+            if not src:
+                continue
+            dest = os.path.join(folder, name + ext)
+            cmd = [ffmpeg, "-y", "-v", "error", "-i", src]
+            cmd += (["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-af", "apad", "-c:a", *acodec,
+                     "-shortest"] if wav else ["-map", "0:v:0", "-c", "copy"])
+            res = run(cmd + extra + [dest])
+            if getattr(res, "returncode", 1) != 0 or not os.path.isfile(dest):
+                err = getattr(res, "stderr", b"") or b""
+                raise RuntimeError(f"Saving {name}{ext} failed: " +
+                                   (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-400:])
+            out.append(name + ext)
+    shutil.rmtree(os.path.join(folder, _WORK_DIR), ignore_errors=True)
+    return out
 
 
 def delete_videos(output_dir, slug):

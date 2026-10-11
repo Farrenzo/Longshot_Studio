@@ -1,6 +1,6 @@
 # H3 Long Shot Studio
 
-## What's new in 0.6.13
+## What's new in 0.6.15
 
 Needs H3 Long Shot **1.6.5 or later** (its Take node, up to 64 Shots, and the Upscale Chunk and
 Save Audio nodes the chunked upscale uses). Replace both
@@ -20,6 +20,10 @@ title in the top bar.
   timeline does the whole take history.
 
 **Timeline viewer**
+- **Full screen** shows the video centred on the whole screen. The control bar and review
+  panel hide and come back when the mouse moves to the bottom of the screen (they stay while
+  the pointer is over them, while dragging the scrubber, or when a control has the keyboard
+  focus); the cursor hides after two seconds without moving.
 - The scrub bar is now a **timeline**: one block per Shot under the video, with its number,
   a thumbnail and **◀ take ▶** arrows. Play and scrub run across every Shot; Shots not
   rendered yet show as dark blocks of their length.
@@ -109,6 +113,14 @@ title in the top bar.
   description stay.
 
 **Output files**
+- **Export approved clips** (under the timeline, once a Shot is approved): each approved
+  Shot's own clip, **whole** (nothing hidden at the joins; trim in your editor), with sound,
+  into `output/longshot/<project>/Approved_Clips/` as `Shot 03 – seed 1724.mp4`, numbered as
+  on the timeline. Nothing is decoded: it's a copy, in seconds. The folder is emptied first,
+  so it always matches the timeline. Shots not approved yet are left out (the message says
+  how many). **Upscale with RTX** instead decodes each approved take again on its own and
+  upscales it (scale and quality from Settings; with ProRes master on, also a `.mov` of
+  each), a frame at a time like the final. **Open folder** in the message opens it.
 - **Upscale in chunks:** Upscale final video (and Update preview with Upscale previews on)
   decodes the film once, then upscales it a frame at a time (the upscaler is set up once per
   piece), straight into the encoder, so RAM holds the decoded film and little else; the upscaled frames never pile up, however

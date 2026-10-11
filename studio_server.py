@@ -88,6 +88,9 @@ def folder_for(which, output_dir, input_dir, project=None, subfolder=None):
             sub = str(subfolder or "").replace("\\", "/").strip("/")
             if os.path.isdir(videos) and sub in ("", pj.videos_subfolder(project)):
                 return videos
+            approved = pj.approved_folder(output_dir, project)
+            if sub == pj.approved_subfolder(project) and os.path.isdir(approved):
+                return approved
         return base
     if which == "input":
         if pj.is_slug(project):
@@ -821,6 +824,8 @@ def register(routes=None):
         try:
             if isinstance(body.get("take_clips"), list):
                 built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
+            elif isinstance(body.get("export_clips"), list):
+                built = gb.build_clip_export(project, body["export_clips"][:64], env=current_env())
             else:
                 built = gb.build_prompt(project, upto=body.get("upto"),
                                         dry_run=bool(body.get("dry_run")), env=current_env(),
@@ -1213,6 +1218,37 @@ def register(routes=None):
         except Exception as err:
             return error(str(err), 500)
         return web.json_response(out)
+
+    @routes.post("/longshot/approved/{slug}")
+    async def approved_clips(request):
+        """Export approved clips. {mode: "copy", items: [{key, name}]} copies each
+        clip whole; {mode: "mux", items: [{name, video, audio, master}]} finishes
+        the upscaled export (adds the sound); {mode: "clear"} empties the folder."""
+        import folder_paths
+        slug, body = slug_of(request), await body_of(request)
+        if not slug or body is None:
+            return error("Send {mode, items}.")
+        out_dir, mode = folder_paths.get_output_directory(), body.get("mode")
+        try:
+            if mode == "copy":
+                names = await asyncio.get_running_loop().run_in_executor(
+                    None, pj.copy_approved, out_dir, slug, body.get("items"))
+            elif mode == "mux":
+                ffmpeg = _ffmpeg_path()
+                if not ffmpeg:
+                    return error("ffmpeg isn't available.", 500)
+                names = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: pj.mux_approved(out_dir, slug, body.get("items"), ffmpeg=ffmpeg))
+            elif mode == "clear":
+                names = []
+                pj.clear_approved(out_dir, slug)
+            else:
+                return error("mode must be copy, mux or clear.")
+        except ValueError as err:
+            return error(err)
+        except Exception as err:
+            return error(str(err), 500)
+        return web.json_response({"files": names, "subfolder": pj.approved_subfolder(slug)})
 
     @routes.post("/longshot/chunks/{slug}/discard")
     async def discard_chunks(request):

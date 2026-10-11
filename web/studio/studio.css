@@ -349,6 +349,16 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .stage:fullscreen .decision { position: absolute; right: 20px; bottom: 14px; width: 420px; background: transparent;
   border: 1px solid rgba(240,180,90,.45); }
 .stage:fullscreen .ctl { background: rgba(29,31,35,.85); }
+/* full screen: the bar hides until the mouse comes to the bottom of the screen */
+.stage:fullscreen .stage-bar-bg { z-index: 1; }
+.stage:fullscreen .vcontrols, .stage:fullscreen .decision { z-index: 2; }
+.stage:fullscreen .stage-bar-bg, .stage:fullscreen .vcontrols, .stage:fullscreen .decision {
+  transition: opacity .22s ease, transform .22s ease; }
+.stage:fullscreen.fs-hide .stage-bar-bg, .stage:fullscreen.fs-hide .vcontrols, .stage:fullscreen.fs-hide .decision {
+  opacity: 0; transform: translateY(14px); pointer-events: none; }
+.stage:fullscreen.fs-idle { cursor: none; }
+@media (prefers-reduced-motion: reduce) {
+  .stage:fullscreen .stage-bar-bg, .stage:fullscreen .vcontrols, .stage:fullscreen .decision { transition: none; } }
 @media (max-width: 900px) {
   .stage:fullscreen .vcontrols { right: 20px; bottom: calc(var(--dec-h, 140px) + 24px); }
   .stage:fullscreen .decision { left: 20px; right: 20px; width: auto; }
@@ -550,6 +560,9 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 @container (max-width: 64px) { .tl-takes span { display: none; } }
 @container (max-width: 40px) { .tl-takes { display: none; } }
 .tl-approx { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.tl-export { display: flex; gap: 12px; align-items: center; }
+.tl-export .export-up { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; white-space: nowrap; }
+.tl-export .linkbtn { white-space: nowrap; }
 .linkbtn { background: none; border: 0; padding: 0; color: var(--amber-lt); font-size: 11px; cursor: pointer; text-decoration: underline; }
 .linkbtn:disabled { opacity: .5; cursor: default; }
 .missing-tag { display: inline-block; margin-top: 3px; font-size: 11px; color: var(--red, #FFB4A8); border: 1px solid #6B2E2E;
