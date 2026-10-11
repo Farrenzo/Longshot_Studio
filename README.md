@@ -1,11 +1,48 @@
 # H3 Long Shot Studio
 
-## What's new in 0.6.3
+## What's new in 0.6.13
 
-Works with H3 Long Shot **1.5.0 or later** (no Long Shot update needed). Replace the
-Studio folder, restart ComfyUI, then hard-refresh the Studio tab.
+Needs H3 Long Shot **1.6.5 or later** (its Take node, up to 64 Shots, and the Upscale Chunk and
+Save Audio nodes the chunked upscale uses). Replace both
+folders, restart ComfyUI, then hard-refresh the Studio tab. The version shows next to the
+title in the top bar.
+
+**Every take has its own clip; the film is stitched and decoded only at the end**
+- A render samples the new Shot in its place in the chain (pinned to its neighbours, as
+  before), then decodes **only that Shot's take, on its own**, into
+  `output/longshot/<project>/clips/`. The rest of the film isn't decoded, so a render's
+  decode costs one Shot however long the film is.
+- **Update preview** and **Upscale final video** take every Shot's take, stitch them in
+  latent space and decode the whole film once (exact joins). The final no longer needs
+  an Update preview first.
+- Takes made before 0.6.5 get their clip by themselves when they show on the timeline
+  (each decoded on its own, nothing sampled). **Make clips for N older takes** under the
+  timeline does the whole take history.
+
+**Timeline viewer**
+- The scrub bar is now a **timeline**: one block per Shot under the video, with its number,
+  a thumbnail and **◀ take ▶** arrows. Play and scrub run across every Shot; Shots not
+  rendered yet show as dark blocks of their length.
+- **Switching takes is instant** and makes it the take the Shot uses: the timeline plays
+  that take's clip, nothing is decoded.
+- **Click a block** to jump there and pick that Shot: Approve, Reroll, Loop and Jump act on
+  it.
+- A take's clip includes the frames it shares with its neighbours; at each join the
+  timeline shows half of them from each side, so its length matches the film. Joins are
+  **approximate** until **Update preview** (or the final): takes never rendered side by
+  side can jump slightly at the cut. After Update preview the timeline plays the exact
+  video until something changes.
 
 **Rendering Shots**
+- **Multi-take** (Settings, next to Reset Shot seeds; 1–8, default 1) works like ComfyUI's
+  batch count: every render (Render Shot N, Reroll, ▶ on its own, Render all, Render odd
+  Shots) runs that many times in a row, each time with new seeds. Above 1, a box asks first:
+  **Render N takes**, **Just 1 take** or **Cancel**. Render all with Multi-take 3 makes three
+  full passes; in each pass every Shot continues from that pass's take of the Shot before.
+  Every take is kept with its own clip. When the batch ends, each Shot shows **take 1** of
+  the batch for review; flip through the others with ◀ ▶ on the timeline. **Stop** ends
+  the batch, and its Shots go back to take 1.
+- **Up to 64 Shots** in a project's chain (was 16; needs Long Shot 1.6.1).
 - **▶ Render all** (Shots panel): one run renders every Shot not rendered yet, each
   continued from the Shot before it. Rendered Shots keep their takes, so gaps between
   them render as bridges.
@@ -19,6 +56,9 @@ Studio folder, restart ComfyUI, then hard-refresh the Studio tab.
   M** (default: in place, the neighbours keep their takes, and it's no longer standalone)
   or **On its own** (a fresh start; the joins become hard cuts until bridged again).
   Re-rendering one after an edit asks the same.
+- **Clear all renders** (Shots panel): every rendered Shot back to "not rendered", keeping
+  prompt, length and seed; optionally **give every Shot a new random seed**. Without new
+  seeds, rendering again brings the same takes back from disk in moments.
 - **Clear render** (in an open Shot): back to "not rendered", keeping prompt, length and
   seed. It then renders again pinned to the Shots around it, or press its ▶ to render it
   on its own. The old take stays in Take history. The same prompt and seed give the same
@@ -33,7 +73,10 @@ Studio folder, restart ComfyUI, then hard-refresh the Studio tab.
   the preview plays every rendered Shot back to back with the Shots not rendered yet left
   out. Nothing is sampled; the marks on the scrub bar show the real Shot numbers.
 - **One by one:** when several Shots are under review, the main button becomes **✓ Approve
-  & review Shot N** and jumps to the next one.
+  & review Shot N**. It moves the timeline to the start of Shot N (and keeps playing if it
+  was playing).
+- **Keys on the timeline:** with the scrub bar selected, **Space** plays / pauses and **← →**
+  step one frame, as everywhere else in the page.
 
 **Editing Shots**
 - Editing a Shot's text, seconds or seed shows **▶ Render Shot N** right away, with
@@ -55,12 +98,28 @@ Studio folder, restart ComfyUI, then hard-refresh the Studio tab.
 - Resolution, aspect and overlap still re-render everything (takes made at another size or
   overlap can't be reused), as do the audio routes.
 
+**Model menus**
+- Model, text encoder, VAE and LoRA menus group files under their subfolders (**H3**,
+  **H3 / Speed**…, files outside a subfolder under **Top level**), each line just the file
+  name. Hover a line for its full path.
+
 **References (Cast & Scenes)**
 - **◀ ▶ under each reference picture** step through the same list as its file menu.
 - **Drop an image on the open reference editor** to replace its picture; typed label and
   description stay.
 
 **Output files**
+- **Upscale in chunks:** Upscale final video (and Update preview with Upscale previews on)
+  decodes the film once, then upscales it a frame at a time (the upscaler is set up once per
+  piece), straight into the encoder, so RAM holds the decoded film and little else; the upscaled frames never pile up, however
+  long the film. It's saved in pieces of **Chunks** seconds (next to Scale and Quality,
+  default 10 s; the status line shows "chunk 3 of 12"). ComfyUI keeps the decoded film
+  between pieces, so it isn't decoded again. The pieces and the sound are then joined into
+  the usual file (pictures copied, not encoded again), and the ProRes master the same way.
+  Stop removes the pieces; nothing half-finished is kept. If only the join fails, the
+  pieces are kept and the same button joins them again without upscaling anything. The joined file has no embedded
+  workflow. A film no longer than one piece renders in one go, as before. The RAM figure
+  under Upscale previews is the decoded film, which is what the upscale needs at its peak.
 - **Videos go into the project's folder:** `output/longshot/<project>/videos/`, next to its
   takes. Older renders stay where they are and still play. Renaming a project moves its
   videos too, and **Open output folder** opens that folder.
@@ -72,6 +131,13 @@ Studio folder, restart ComfyUI, then hard-refresh the Studio tab.
 - **Export:** **Include videos** (off by default) adds everything in the project's videos
   folder; Import puts them back.
 - The project list shows a frame of the video when there's no PNG.
+- **Open input / output folder** brings the Explorer window to the front on Windows (if
+  Windows won't allow that, it flashes on the taskbar).
+
+**Projects**
+- **Delete…** can also delete the project's videos (and its timeline clips), next to its
+  takes and input folder.
+- **Open…** marks projects whose folders were deleted by hand with **files missing**.
 
 **Memory**
 - **Free VRAM**, **Free RAM** and **Clear cache** in the top bar, next to the RAM / GPU /
@@ -172,7 +238,7 @@ Timeline Shot nodes) and queues it on ComfyUI.
 | Pack | Needed for |
 |---|---|
 | [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | Shot, Subject, Ref Prompt Builder r2v (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.5.0 or later** | rendering; adds the timeline mode (takes, locks, pins) and Clip Shots the Studio uses (always) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.6.5 or later** | rendering; adds the timeline mode (takes, locks, pins), Clip Shots, and the Take, Upscale Chunk and Save Audio nodes the Studio uses (always) |
 | [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | resizing references, optional Sage attention (always) |
 | [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) | saving the video, loading audio (always) |
 | [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | only when Turbo is on |

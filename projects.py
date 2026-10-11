@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.6.3"
+STUDIO_VERSION = "0.6.13"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -78,7 +78,8 @@ class ProjectStore:
         project["slug"] = slug
         return project
 
-    def list(self):
+    def list(self, check=None):
+        """Saved projects, newest first. check(slug, project) may add fields."""
         out = []
         if not os.path.isdir(self.folder):
             return out
@@ -97,6 +98,11 @@ class ProjectStore:
                         "shots": len([s for s in p.get("shots") or [] if not s.get("bypassed")]),
                         "approved": len([s for s in p.get("shots") or []
                                          if s.get("status") == "approved" and not s.get("bypassed")])})
+            if check is not None:
+                try:
+                    out[-1].update(check(slug, p) or {})
+                except Exception:
+                    pass
         out.sort(key=lambda p: p["saved_at"], reverse=True)
         return out
 
@@ -380,6 +386,276 @@ def videos_folder(output_dir, slug):
 
 def videos_subfolder(slug):
     return f"longshot/{slug}/videos"
+
+
+# ---------------------------------------------------------------------------
+# Timeline clips: each take's piece of a rendered video, cut on the CPU so the
+# timeline can switch takes without decoding anything again.
+#   output/longshot/<slug>/clips/<key>.mp4 (+ .jpg thumbnail), index.json
+# ---------------------------------------------------------------------------
+
+CLIP_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,160}")
+
+
+def clips_folder(output_dir, slug):
+    return os.path.join(output_dir, "longshot", slug, "clips")
+
+
+def clips_subfolder(slug):
+    return f"longshot/{slug}/clips"
+
+
+def clip_index(output_dir, slug):
+    """{key: {dur, made, thumb}} for clips whose file is there."""
+    folder = clips_folder(output_dir, slug)
+    if not is_slug(slug) or not os.path.isdir(folder):
+        return {}
+    try:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as fh:
+            index = json.load(fh)
+    except (OSError, ValueError):
+        index = {}
+    out = {}
+    for key, info in (index.items() if isinstance(index, dict) else []):
+        if CLIP_KEY_RE.fullmatch(str(key)) and isinstance(info, dict) and \
+                os.path.isfile(os.path.join(folder, key + ".mp4")):
+            out[key] = {"dur": float(info.get("dur") or 0), "made": info.get("made") or "",
+                        "thumb": bool(info.get("thumb")) and os.path.isfile(os.path.join(folder, key + ".jpg"))}
+    return out
+
+
+def clip_commands(ffmpeg, src, folder, key, start, dur):
+    """The two ffmpeg runs for one clip: the piece (re-encoded, so the cut is
+    frame-exact) and a small thumbnail from its middle."""
+    tmp = os.path.join(folder, f".{key}.tmp.mp4")
+    clip = ["ffmpeg" if not ffmpeg else ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{start:.4f}", "-i", src, "-t", f"{dur:.4f}",
+            "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", tmp]
+    thumb = ["ffmpeg" if not ffmpeg else ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+             "-ss", f"{start + min(0.5, dur / 2):.4f}", "-i", src, "-frames:v", "1",
+             "-vf", "scale=192:-2", "-q:v", "5", os.path.join(folder, key + ".jpg")]
+    return clip, thumb, tmp
+
+
+def cut_clips(output_dir, slug, video, rows, run, ffmpeg=None):
+    """Cut each row's piece of a rendered video into the project's clips folder.
+
+    rows: [{key, start, end}] in that video's seconds. `run(cmd)` runs one
+    command and returns True on success (the server passes subprocess; tests a
+    stand-in). Returns the new clip_index."""
+    if not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    src = _video_path(output_dir, video)
+    root = os.path.realpath(os.path.join(output_dir, "longshot"))
+    if not src or not os.path.realpath(src).startswith(root + os.sep):
+        raise ValueError("That video isn't a render in output/longshot.")
+    folder = clips_folder(output_dir, slug)
+    os.makedirs(folder, exist_ok=True)
+    try:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as fh:
+            index = json.load(fh)
+        if not isinstance(index, dict):
+            index = {}
+    except (OSError, ValueError):
+        index = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        key = str(r.get("key") or "")
+        try:
+            start, end = float(r.get("start")), float(r.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not CLIP_KEY_RE.fullmatch(key) or start < 0 or end - start < 0.04:
+            continue
+        clip, thumb, tmp = clip_commands(ffmpeg, src, folder, key, start, end - start)
+        if not run(clip) or not os.path.isfile(tmp):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            continue
+        os.replace(tmp, os.path.join(folder, key + ".mp4"))
+        index[key] = {"dur": round(end - start, 4), "made": now_iso(), "thumb": bool(run(thumb))}
+    fd, tmpi = tempfile.mkstemp(dir=folder, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(index, fh, indent=1)
+    os.replace(tmpi, os.path.join(folder, "index.json"))
+    return clip_index(output_dir, slug)
+
+
+_CLIP_FILE_RE = re.compile(r"[A-Za-z0-9_-]{1,160}_\d{5,}(-audio)?\.mp4")
+
+
+def adopt_clips(output_dir, slug, items, probe=None, thumb=None):
+    """Clips Video Combine just saved into clips/ (<name>_00001-audio.mp4) become
+    <key>.mp4 in the index. items: [{key, file: {filename, subfolder}}].
+    probe(path) -> seconds (or None); thumb(src, dest_jpg) -> bool."""
+    if not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    folder = clips_folder(output_dir, slug)
+    os.makedirs(folder, exist_ok=True)
+    try:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as fh:
+            index = json.load(fh)
+        if not isinstance(index, dict):
+            index = {}
+    except (OSError, ValueError):
+        index = {}
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        key, f = str(it.get("key") or ""), it.get("file") or {}
+        name = str(f.get("filename") or "")
+        sub = str(f.get("subfolder") or "").replace("\\", "/").strip("/")
+        if not CLIP_KEY_RE.fullmatch(key) or sub != clips_subfolder(slug) or not _CLIP_FILE_RE.fullmatch(name):
+            continue
+        src = os.path.join(folder, name)
+        if not os.path.isfile(src):
+            continue
+        dest = os.path.join(folder, key + ".mp4")
+        os.replace(src, dest)
+        stem = name[:-len("-audio.mp4")] if name.endswith("-audio.mp4") else name[:-4]
+        for extra in (stem + ".png", stem + ".mp4"):          # the PNG and the silent copy
+            x = os.path.join(folder, extra)
+            if extra != key + ".mp4" and os.path.isfile(x):
+                os.remove(x)
+        dur = probe(dest) if probe else None
+        index[key] = {"dur": round(float(dur), 4) if dur else float(it.get("dur") or 0), "made": now_iso(),
+                      "thumb": bool(thumb(dest, os.path.join(folder, key + ".jpg"))) if thumb else False}
+    fd, tmpi = tempfile.mkstemp(dir=folder, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(index, fh, indent=1)
+    os.replace(tmpi, os.path.join(folder, "index.json"))
+    return clip_index(output_dir, slug)
+
+
+# ---------------------------------------------------------------------------
+# Chunked upscale: chunk files (no sound) + the sound, joined into one video
+# ---------------------------------------------------------------------------
+
+CHUNKS_DIR = "_chunks"
+_CHUNK_EXT_RE = re.compile(r".+\.(mp4|mov|wav)", re.IGNORECASE)
+_FORBIDDEN = set('<>:"/\\|?*')
+
+
+def _plain_file_name(name, limit=240):
+    """A file name the Studio writes (a project name may have spaces, accents,
+    apostrophes…): no folders, nothing Windows forbids, no leading dot."""
+    return isinstance(name, str) and 0 < len(name) <= limit and name.strip() == name \
+        and not name.startswith(".") and ".." not in name \
+        and not any(c in _FORBIDDEN or ord(c) < 32 for c in name)
+
+
+def chunks_folder(output_dir, slug):
+    return os.path.join(videos_folder(output_dir, slug), CHUNKS_DIR)
+
+
+def discard_chunks(output_dir, slug):
+    """Remove videos/_chunks (left over from a chunked upscale). True if it was there."""
+    folder = chunks_folder(output_dir, slug)
+    if not is_slug(slug) or not os.path.isdir(folder):
+        return False
+    shutil.rmtree(folder, ignore_errors=True)
+    return True
+
+
+def _chunk_path(output_dir, slug, entry):
+    """A chunk file Video Combine / Save Audio wrote, as a path; ValueError otherwise."""
+    if not isinstance(entry, dict):
+        raise ValueError("A chunk is {filename, subfolder}.")
+    name, sub = entry.get("filename"), (entry.get("subfolder") or "").replace("\\", "/").strip("/")
+    if sub != f"{videos_subfolder(slug)}/{CHUNKS_DIR}" or not _plain_file_name(name) \
+            or not _CHUNK_EXT_RE.fullmatch(name):
+        raise ValueError(f"Not a chunk of this project: {sub}/{name}")
+    path = os.path.join(chunks_folder(output_dir, slug), name)
+    if not os.path.isfile(path):
+        raise ValueError(f"The chunk {name} is missing.")
+    return path
+
+
+def _next_number(folder, stem):
+    rx = re.compile(re.escape(stem) + r"_(\d{5,})(-audio)?\.(mp4|mov|webm|mkv|png)", re.IGNORECASE)
+    n = 0
+    for f in os.listdir(folder) if os.path.isdir(folder) else []:
+        m = rx.fullmatch(f)
+        if m:
+            n = max(n, int(m.group(1)))
+    return n + 1
+
+
+def join_chunks(output_dir, slug, prefix, chunks, audio=None, masters=None, ffmpeg="ffmpeg", run=None):
+    """Join chunk videos (in order) and the sound into videos/<Name>_NNNNN-audio.mp4
+    (and the ProRes chunks into <Name>_master_NNNNN-audio.mov). The pictures are
+    copied, not encoded again. `prefix` is the render's own file prefix
+    (longshot/<slug>/videos/<Name>[_final]). Returns {video, master} entries
+    like Video Combine's; the chunks folder is removed afterwards (and kept
+    when joining fails, so it can be tried again)."""
+    import subprocess
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=1800))
+    if not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    prefix = str(prefix or "").replace("\\", "/")
+    head, _, stem = prefix.rpartition("/")
+    if head != videos_subfolder(slug) or not _plain_file_name(stem, 160):
+        raise ValueError("The joined video goes into the project's videos folder.")
+    if not chunks:
+        raise ValueError("No chunks to join.")
+    vids = [_chunk_path(output_dir, slug, c) for c in chunks]
+    wav = _chunk_path(output_dir, slug, audio) if audio else None
+    mast = [_chunk_path(output_dir, slug, c) for c in (masters or [])]
+    folder = videos_folder(output_dir, slug)
+    n = max(_next_number(folder, stem), _next_number(folder, stem + "_master"))
+
+    def one(files, out_name, audio_codec, extra):
+        listing = os.path.join(chunks_folder(output_dir, slug), out_name + ".txt")
+        with open(listing, "w", encoding="utf-8") as fh:
+            for f in files:
+                fh.write("file '" + f.replace("'", "'\\''") + "'\n")
+        out = os.path.join(folder, out_name)
+        tmp = os.path.join(chunks_folder(output_dir, slug), "joining_" + out_name)
+        cmd = [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing]
+        if wav:
+            cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", *audio_codec, "-shortest"]
+        else:
+            cmd += ["-map", "0:v:0", "-c", "copy"]
+        cmd += [*extra, tmp]
+        res = run(cmd)
+        if getattr(res, "returncode", 1) != 0 or not os.path.isfile(tmp):
+            err = getattr(res, "stderr", b"") or b""
+            raise RuntimeError("Joining the chunks failed: " +
+                               (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-600:])
+        os.replace(tmp, out)
+        return {"filename": out_name, "subfolder": videos_subfolder(slug), "type": "output",
+                "format": "video/" + ("quicktime" if out_name.endswith(".mov") else "mp4"),
+                "frame_rate": 24.0, "fullpath": out}
+
+    video = one(vids, f"{stem}_{n:05d}-audio.mp4", ["aac", "-b:a", "256k"], ["-movflags", "+faststart"])
+    master = one(mast, f"{stem}_master_{n:05d}-audio.mov", ["pcm_s24le"], []) if mast else None
+    discard_chunks(output_dir, slug)
+    return {"video": video, "master": master}
+
+
+def delete_videos(output_dir, slug):
+    """Delete this project's videos and timeline clips folders."""
+    n = 0
+    for folder in (videos_folder(output_dir, slug), clips_folder(output_dir, slug)):
+        if is_slug(slug) and os.path.isdir(folder):
+            shutil.rmtree(folder)
+            n += 1
+    return n > 0
+
+
+def files_missing(input_dir, output_dir, slug, project):
+    """True when the project uses its own folders but they're gone (deleted by
+    hand): its input folder while references live there, or its takes folder
+    while Shots have takes."""
+    sub = project_input_subfolder(slug)
+    uses_inputs = any((item.get("subfolder") or "").replace("\\", "/").strip("/") == sub
+                      for _k, item, _f in _refs(project))
+    if uses_inputs and not os.path.isdir(os.path.join(input_dir, "longshot", slug)):
+        return True
+    has_takes = any(isinstance(sh, dict) and sh.get("take") for sh in project.get("shots") or [])
+    return has_takes and not os.path.isdir(takes_folder(output_dir, slug))
 
 
 def list_videos(output_dir, slug):

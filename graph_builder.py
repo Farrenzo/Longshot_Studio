@@ -25,7 +25,7 @@ from . import projects as pj
 FPS = 24
 CUT_VERB = "the camera cuts to"
 MAX_REFERENCES = 9          # Long Shot's ref_images autogrow limit
-MAX_SHOTS = 16              # Long Shot's planner limit
+MAX_SHOTS = 64              # Long Shot's planner limit (1.6.1; 16 before)
 MAX_SEED = 0xFFFFFFFFFFFFFFFF
 OUTPUT_SUBFOLDER = "longshot"
 VIDEOS_SUBFOLDER = "videos"     # output/longshot/<slug>/videos
@@ -49,6 +49,10 @@ MEGAPIXELS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.98, 1.0, 1.2, 1.5, 1.8, 
 # Which pack provides each node class, for "missing node" errors.
 PACKS = {
     "MiniMaxH3TimelineShot": "H3 Long Shot 1.4.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3Take": "H3 Long Shot 1.6.0+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3FrameRange": "H3 Long Shot 1.6.2+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3UpscaleChunk": "H3 Long Shot 1.6.2+ (github.com/r34vtraining/H3_Longshot)",
+    "MiniMaxH3SaveAudio": "H3 Long Shot 1.6.2+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3Clip": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3ClipShot": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
     "MiniMaxH3ClipPixels": "H3 Long Shot 1.5.0+ (github.com/r34vtraining/H3_Longshot)",
@@ -261,6 +265,82 @@ def _out(link, index):
     return [link[0], index]
 
 
+CLIPS_SUBFOLDER = "clips"      # output/longshot/<slug>/clips: one video per take
+
+
+def clips_subfolder(project: dict) -> str:
+    return f"{OUTPUT_SUBFOLDER}/{project_slug(project)}/{CLIPS_SUBFOLDER}"
+
+
+def _clip_save(g, n, project, images, audio, fmt, name):
+    """Video Combine for one take's own clip (no metadata: it's a working file)."""
+    quality = dict(bitrate=8, megabit=True) if fmt == NVENC else dict(crf=19)
+    return g.add(f"clipsave{n}", "VHS_VideoCombine", f"Clip {name}", frame_rate=FPS, loop_count=0,
+                 filename_prefix=f"{clips_subfolder(project)}/{name}", format=fmt, pix_fmt="yuv420p",
+                 **quality, save_metadata=False, pingpong=False, save_output=True,
+                 images=images, audio=audio)
+
+
+def _video_format(env, warnings):
+    fmt = NVENC
+    if env.video_formats is not None and NVENC not in env.video_formats:
+        if H264 not in env.video_formats:
+            raise BuildError("Video Helper Suite offers neither nvenc nor h264 mp4 output.")
+        fmt = H264
+        warnings.append("NVENC isn't available; saving with the software h264 encoder.")
+    return fmt
+
+
+def _maybe_vsr(g, n, s, images):
+    vsr = s.get("rtx_vsr") or {}
+    if not vsr.get("on"):
+        return images
+    quality = vsr.get("quality", "ULTRA")
+    if quality not in VSR_QUALITIES:
+        raise BuildError(f"RTX Super Resolution quality must be one of {', '.join(VSR_QUALITIES)}.")
+    return g.add(f"clipvsr{n}", "RTXVideoSuperResolution", "RTX Video Super Resolution",
+                 images=images, resize_type="scale by multiplier",
+                 **{"resize_type.scale": _num(vsr.get("scale", 2.0), "RTX upscale factor", 1, 4)},
+                 quality=quality)
+
+
+def build_take_clips(project: dict, takes: list, env: Env | None = None) -> Build:
+    """Decode takes on their own into clips: [{key, take}] -> one branch each
+    (MiniMax H3 Take -> VAE Decode (+audio) -> Video Combine into clips/).
+    Nothing samples and nothing is stitched."""
+    env = env or Env()
+    s = project.get("settings") or {}
+    need = ["MiniMaxH3Take", "VAELoader", "VAEDecode", "VAEDecodeAudio", "VHS_VideoCombine"]
+    if (s.get("rtx_vsr") or {}).get("on"):
+        need.append("RTXVideoSuperResolution")
+    missing = [c for c in need if not env.has(c)]
+    if missing:
+        raise BuildError("ComfyUI is missing node(s) this needs:\n  " +
+                         "\n  ".join(f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing))
+    for key in ("video_vae", "audio_vae"):
+        if not s.get(key):
+            raise BuildError(f"Settings: choose a {key.replace('_', ' ')} file.")
+    warnings = []
+    fmt = _video_format(env, warnings)
+    g = _Graph()
+    vae = g.add("vae_video", "VAELoader", "Video VAE", vae_name=s["video_vae"])
+    avae = g.add("vae_audio", "VAELoader", "Audio VAE", vae_name=s["audio_vae"])
+    clips = {}
+    for n, t in enumerate(takes or [], 1):
+        key, take = str(t.get("key") or ""), str(t.get("take") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", key) or not TAKE_NAME_RE.fullmatch(take):
+            raise BuildError(f"Not a take: {take!r}")
+        lat = g.add(f"take{n}", "MiniMaxH3Take", f"Take {take}", cache_name=project_slug(project),
+                    take=take, shot_id="")
+        images = _maybe_vsr(g, n, s, g.add(f"clipdec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae))
+        audio = g.add(f"clipaud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+        clips[key] = _clip_save(g, n, project, images, audio, fmt, key)[0]
+    if not clips:
+        raise BuildError("No takes to make clips for.")
+    return Build(prompt=g.nodes, width=0, height=0, chain=[], nodes={"clips": clips},
+                 filename_prefix=clips_subfolder(project), video_format=fmt, warnings=warnings)
+
+
 def required_classes(project: dict, dry_run: bool = False, final: bool = False) -> list:
     """Node classes the build will use, given the project's toggles."""
     s = project.get("settings") or {}
@@ -292,7 +372,8 @@ def required_classes(project: dict, dry_run: bool = False, final: bool = False) 
 
 
 def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
-                 env: Env | None = None, final: bool = False, standalone: bool = False) -> Build:
+                 env: Env | None = None, final: bool = False, standalone: bool = False,
+                 clips_for=None, chunk=None) -> Build:
     """Turn a Studio project into an API prompt rendering the chain of active
     Shots up to and including `upto` (all active Shots when None).
 
@@ -303,7 +384,20 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
 
     standalone=True renders the Shot `upto` on its own: a one-Shot timeline, so
     it starts fresh from the references with no pin to the Shots around it. Its
-    take is saved under its id like any other; later chains lock it."""
+    take is saved under its id like any other; later chains lock it.
+
+    clips_for=[shot ids] (a render while reviewing): the stitched film isn't
+    decoded. Each of those Shots' new take is decoded on its own into
+    clips/<shot id>_#####-audio.mp4 instead (MiniMax H3 Take after Long Shot),
+    so a render's decode costs one Shot, however long the film.
+
+    chunk={index, start, length[, audio]} (an upscaled whole-film render, a
+    chunk at a time): the film is decoded as usual (ComfyUI keeps the decoded
+    frames between runs), then only frames start .. start+length-1 are
+    upscaled, a few at a time straight into the encoder (MiniMax H3 Upscale
+    Chunk), and saved without sound as videos/_chunks/<Name>[_final]_cNNN.
+    audio=True also saves the film's sound as videos/_chunks/<Name>_audio.wav.
+    The server joins the chunks and the sound afterwards."""
     env = env or Env()
     if not isinstance(project, dict):
         raise BuildError("The project must be a JSON object.")
@@ -313,7 +407,23 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
     warnings = []
 
     upscale_final = bool(final)      # (`final` is reused below for the song route)
-    missing = [c for c in dict.fromkeys(required_classes(project, dry_run, upscale_final)) if not env.has(c)]
+    clip_ids = [str(x) for x in (clips_for or [])] if not dry_run and not upscale_final else []
+    need_classes = required_classes(project, dry_run, upscale_final)
+    if clip_ids:
+        need_classes = need_classes + ["MiniMaxH3Take", "VAEDecodeAudio"]
+    if chunk is not None:
+        if dry_run or clip_ids:
+            raise BuildError("A chunk is part of a whole-film render.")
+        try:
+            chunk = {"index": int(chunk.get("index", 0)), "start": int(chunk.get("start", 0)),
+                     "length": int(chunk.get("length", 0)), "audio": bool(chunk.get("audio"))}
+        except (TypeError, ValueError, AttributeError):
+            raise BuildError("A chunk needs index, start and length.") from None
+        if chunk["start"] < 0 or chunk["length"] < 1 or not 0 <= chunk["index"] < 10000:
+            raise BuildError("A chunk needs a start of 0 or more and a length of 1 or more.")
+        need_classes = [c for c in need_classes if c not in ("RTXVideoSuperResolution", "VHS_VideoCombine")] + \
+            ["MiniMaxH3UpscaleChunk", "RTXVideoSuperResolution"] + (["MiniMaxH3SaveAudio"] if chunk["audio"] else [])
+    missing = [c for c in dict.fromkeys(need_classes) if not env.has(c)]
     if missing:
         rows = [f"{c} — from {PACKS.get(c, 'ComfyUI core')}" for c in missing]
         raise BuildError("ComfyUI is missing node(s) this project needs:\n  " + "\n  ".join(rows))
@@ -509,43 +619,85 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                       cache_name=project_slug(project), audio_vae=avae,
                       **long_extra, **refs)
 
-    # --- output -----------------------------------------------------------------
+    # --- output: each new take's own clip (renders while reviewing) -----------------
+    ids_in_chain = [str(x.get("id")) for x in chain if x.get("kind") != "clip"]
+    targets = [i for i in dict.fromkeys(clip_ids) if i in ids_in_chain]
+    if targets:
+        fmt = _video_format(env, warnings)
+        clips = {}
+        for n, sid in enumerate(targets, 1):
+            lat = g.add(f"take{n}", "MiniMaxH3Take", f"[{sid}] its take", cache_name=project_slug(project),
+                        take="", shot_id=sid, after=_out(long_shot, 1))
+            imgs = _maybe_vsr(g, n, s, g.add(f"clipdec{n}", "VAEDecode", "VAE Decode", samples=lat, vae=vae))
+            aud = g.add(f"clipaud{n}", "VAEDecodeAudio", "VAE Decode Audio", samples=lat, vae=avae)
+            clips[sid] = _clip_save(g, n, project, imgs, aud, fmt,
+                                    re.sub(r"[^A-Za-z0-9_-]+", "_", sid)[:64] or "shot")[0]
+        ids.update(longshot="longshot", builder="builder", clips=clips)
+        return Build(prompt=g.nodes, width=width, height=height,
+                     chain=[x.get("id") for x in chain], nodes=ids,
+                     filename_prefix=clips_subfolder(project), video_format=fmt, warnings=warnings)
+
+    # --- output: the stitched film, decoded once ------------------------------------
     images = g.add("decode", "VAEDecode", "VAE Decode", samples=long_shot, vae=vae)
     if upscale_final and s.get("clip_pixels") and any(sh.get("kind") == "clip" for sh in chain):
         images = g.add("clip_pixels", "MiniMaxH3ClipPixels", "Original clip pixels",
                        images=images, latent=long_shot, enabled=True)
     vsr = s.get("rtx_vsr") or {}
-    if vsr.get("on") or upscale_final:
+    upscales = bool(vsr.get("on") or upscale_final)
+    if upscales:
+        vsr_quality = vsr.get("quality", "ULTRA")
+        if vsr_quality not in VSR_QUALITIES:
+            raise BuildError(f"RTX Super Resolution quality must be one of {', '.join(VSR_QUALITIES)}.")
+        vsr_scale = _num(vsr.get("scale", 2.0), "RTX upscale factor", 1, 4)
+    if upscales and chunk is None:
         # NVIDIA RTX Video Super Resolution on the decoded frames, before saving.
         # Runs after Long Shot, so it never changes which segments are reused.
-        quality = vsr.get("quality", "ULTRA")
-        if quality not in VSR_QUALITIES:
-            raise BuildError(f"RTX Super Resolution quality must be one of {', '.join(VSR_QUALITIES)}.")
         images = g.add("vsr", "RTXVideoSuperResolution", "RTX Video Super Resolution",
                        images=images, resize_type="scale by multiplier",
-                       **{"resize_type.scale": _num(vsr.get("scale", 2.0), "RTX upscale factor", 1, 4)},
-                       quality=quality)
+                       **{"resize_type.scale": vsr_scale}, quality=vsr_quality)
     # Song in final video: the loader's (trimmed) audio replaces H3's decoded
     # audio, so the decoder isn't built at all.
-    decoded_audio = None if final else g.add("decode_audio", "VAEDecodeAudio",
-                                             "VAE Decode Audio", samples=long_shot, vae=avae)
-    fmt = NVENC
-    if env.video_formats is not None and NVENC not in env.video_formats:
-        if H264 not in env.video_formats:
-            raise BuildError("Video Helper Suite offers neither nvenc nor h264 mp4 output.")
-        fmt = H264
-        warnings.append("NVENC isn't available; saving with the software h264 encoder.")
+    decoded_audio = None if final or (chunk is not None and not chunk["audio"]) else \
+        g.add("decode_audio", "VAEDecodeAudio", "VAE Decode Audio", samples=long_shot, vae=avae)
+    fmt = _video_format(env, warnings)
     # Renders go into the project's own folder, next to its takes:
     # output/longshot/<slug>/videos/<Name>_00001-audio.mp4
     prefix = f"{videos_subfolder(project)}/{safe_name(project.get('name'))}" + \
         ("_final" if upscale_final else "")
+    out_audio = loader if final else decoded_audio
+    if chunk is not None:
+        # A chunk: frames start .. start+length-1, upscaled a few at a time and
+        # piped straight into the encoder (no sound; joined later). Nothing big is
+        # left in ComfyUI's cache, so chunks don't pile up in RAM. The sound goes
+        # to a WAV once, with the first chunk.
+        if not upscales:
+            raise BuildError("Chunks are for upscaled renders.")
+        name = safe_name(project.get("name"))
+        cprefix = f"{videos_subfolder(project)}/_chunks/{name}" + ("_final" if upscale_final else "") + \
+            f"_c{chunk['index']:03d}"
+        master = upscale_final and bool(s.get("prores_master"))
+        g.add("upscale_chunk", "MiniMaxH3UpscaleChunk", "Upscale chunk → file", images=images,
+              start=chunk["start"], length=chunk["length"], scale=vsr_scale, quality=vsr_quality,
+              filename_prefix=cprefix, codec="h264_nvenc" if fmt == NVENC else "libx264",
+              master_prefix=cprefix + "_master" if master else "", frame_rate=float(FPS))
+        ids.update(chunk="upscale_chunk", combine="combine")
+        if master:
+            ids["prores"] = "combine_prores"
+        if chunk["audio"]:
+            g.add("save_audio", "MiniMaxH3SaveAudio", "Sound for the chunks", audio=out_audio,
+                  filename_prefix=f"{videos_subfolder(project)}/_chunks/{name}_audio")
+            ids["audio_file"] = "save_audio"
+        ids.update(longshot="longshot", builder="builder")
+        return Build(prompt=g.nodes, width=width, height=height,
+                     chain=[x.get("id") for x in chain], nodes=ids, filename_prefix=prefix,
+                     video_format=fmt, warnings=warnings)
     # nvenc takes a bitrate; the software h264 format takes a quality (crf) instead.
     quality = dict(bitrate=8, megabit=True) if fmt == NVENC else dict(crf=19)
-    out_audio = loader if final else decoded_audio
+    sound = {} if out_audio is None else {"audio": out_audio}
     combine = g.add("combine", "VHS_VideoCombine", "Video Combine",
                     frame_rate=FPS, loop_count=0, filename_prefix=prefix, format=fmt,
                     pix_fmt="yuv420p", **quality, save_metadata=True,
-                    pingpong=False, save_output=True, images=images, audio=out_audio)
+                    pingpong=False, save_output=True, images=images, **sound)
 
     if upscale_final and s.get("prores_master"):
         # A second Video Combine on the same frames and sound: a ProRes 422 HQ
@@ -562,7 +714,7 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
                              "Update ComfyUI-VideoHelperSuite, or turn the ProRes master off.")
         g.add("combine_prores", "VHS_VideoCombine", "ProRes master",
               frame_rate=FPS, loop_count=0, filename_prefix=prefix + "_master", format=pr_fmt,
-              **pr_extra, pingpong=False, save_output=True, images=images, audio=out_audio)
+              **pr_extra, pingpong=False, save_output=True, images=images, **sound)
         ids["prores"] = "combine_prores"
 
     ids.update(longshot="longshot", combine="combine", builder="builder")

@@ -21,6 +21,9 @@
     POST /longshot/cleanup-outputs {prompt_id, png, noaudio}: delete a finished render's
                                    first-frame PNG and/or silent video (output/longshot only)
     POST /longshot/clear-cache     drop Long Shot's in-memory pieces (takes on disk stay)
+    GET  /longshot/clips/<slug>    the timeline clips: {key: {dur, made, thumb}}
+    POST /longshot/clips/<slug>    {video, rows: [{key, start, end}]}: cut pieces of a video (CPU, ffmpeg)
+    POST /longshot/clips/<slug>/adopt {items: [{key, file}]}: register clips a render decoded per take
 
 The browser talks to ComfyUI's own endpoints for everything else: /prompt,
 /ws, /history, /view, /interrupt.
@@ -550,6 +553,152 @@ def launch(cmd):
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# --- Windows: the Explorer window opened for the browser comes up behind it,
+# because Windows only lets the foreground app raise windows. Find the new
+# window and bring it to the front; if Windows still refuses, flash it on the
+# taskbar. Never raises, and does nothing on other systems.
+
+def pick_window(windows, before, name):
+    """The Explorer window to raise. windows: [(hwnd, title)] of the visible
+    Explorer windows now; before: the hwnds that were open before the launch.
+    Prefer a new window, then one whose title is the folder (Explorer reuses a
+    window that already shows it), else None to keep waiting."""
+    name = (name or "").lower()
+    def match(title):
+        t = (title or "").lower()
+        return bool(name) and (t == name or t.endswith("\\" + name) or name in t)
+    new = [(h, t) for h, t in windows if h not in before]
+    for h, t in new:
+        if match(t):
+            return h
+    if len(new) == 1:
+        return new[0][0]
+    for h, t in windows:
+        if match(t):
+            return h
+    return None
+
+
+def _win_api(ctypes):
+    """user32/kernel32 with the signatures set, so 64-bit window handles pass intact."""
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    H, B, I, D = wintypes.HWND, wintypes.BOOL, ctypes.c_int, wintypes.DWORD
+    sigs = {"IsWindowVisible": ([H], B), "IsIconic": ([H], B), "ShowWindow": ([H, I], B),
+            "SetForegroundWindow": ([H], B), "GetForegroundWindow": ([], H), "BringWindowToTop": ([H], B),
+            "GetWindowThreadProcessId": ([H, ctypes.c_void_p], D), "AttachThreadInput": ([D, D, B], B),
+            "GetClassNameW": ([H, wintypes.LPWSTR, I], I), "GetWindowTextW": ([H, wintypes.LPWSTR, I], I),
+            "AllowSetForegroundWindow": ([D], B)}
+    for fn, (args, res) in sigs.items():
+        f = getattr(user32, fn)
+        f.argtypes, f.restype = args, res
+    kernel32.GetCurrentThreadId.restype = D
+    return user32, kernel32
+
+
+def _explorer_windows(user32, ctypes):
+    from ctypes import wintypes
+    found = []
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            if cls.value in ("CabinetWClass", "ExploreWClass"):
+                buf = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, buf, 512)
+                found.append((int(hwnd or 0), buf.value))
+        except Exception:
+            pass
+        return True
+    user32.EnumWindows(proc(each), 0)
+    return found
+
+
+def _raise_window(user32, kernel32, hwnd):
+    """SetForegroundWindow with the usual workarounds; True when it worked."""
+    from ctypes import wintypes
+    SW_RESTORE, SW_SHOW = 9, 5
+    user32.ShowWindow(hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW)
+    if user32.SetForegroundWindow(hwnd) and user32.GetForegroundWindow() == hwnd:
+        return True
+    # join the input queue of the window that has the foreground, then raise
+    fg = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    me = kernel32.GetCurrentThreadId()
+    attached = bool(fg_thread) and fg_thread != me and user32.AttachThreadInput(me, fg_thread, True)
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(me, fg_thread, False)
+    if user32.GetForegroundWindow() == hwnd:
+        return True
+    # a key press counts as user input, which lets this process set the foreground
+    VK_MENU, KEYUP = 0x12, 0x0002
+    user32.keybd_event(VK_MENU, 0, 0, 0)
+    user32.keybd_event(VK_MENU, 0, KEYUP, 0)
+    user32.SetForegroundWindow(hwnd)
+    return user32.GetForegroundWindow() == hwnd
+
+
+def _flash_window(user32, ctypes, hwnd):
+    from ctypes import wintypes
+    class FLASHWINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND), ("dwFlags", wintypes.DWORD),
+                    ("uCount", wintypes.UINT), ("dwTimeout", wintypes.DWORD)]
+    FLASHW_ALL, FLASHW_TIMERNOFG = 0x3, 0xC
+    info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0)
+    user32.FlashWindowEx(ctypes.byref(info))
+
+
+def explorer_snapshot(platform=None):
+    """The Explorer windows open now (hwnds), before a launch. Empty off Windows."""
+    if not (platform or sys.platform).startswith("win"):
+        return set()
+    try:
+        import ctypes
+        return {h for h, _ in _explorer_windows(_win_api(ctypes)[0], ctypes)}
+    except Exception:
+        return set()
+
+
+def bring_to_front(folder, before, platform=None, wait=4.0):
+    """Windows only: in the background, wait for the Explorer window showing
+    `folder` and bring it to the front (flash it on the taskbar if Windows
+    won't allow that). Returns the thread, or None off Windows."""
+    if not (platform or sys.platform).startswith("win"):
+        return None
+    import threading
+    import time
+
+    def run():
+        try:
+            import ctypes
+            user32, kernel32 = _win_api(ctypes)
+            user32.AllowSetForegroundWindow(0xFFFFFFFF)    # ASFW_ANY
+            name = os.path.basename(os.path.normpath(folder))
+            end = time.monotonic() + wait
+            hwnd = None
+            while time.monotonic() < end and not hwnd:
+                time.sleep(0.15)
+                hwnd = pick_window(_explorer_windows(user32, ctypes), before, name)
+            if not hwnd:
+                return
+            time.sleep(0.1)                                # let Explorer finish showing it
+            if not _raise_window(user32, kernel32, hwnd):
+                _flash_window(user32, ctypes, hwnd)
+        except Exception as err:                           # never break the route
+            logger.debug("H3 Long Shot Studio: couldn't raise the folder window: %s", err)
+
+    t = threading.Thread(target=run, name="longshot-raise-folder", daemon=True)
+    t.start()
+    return t
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -670,10 +819,15 @@ def register(routes=None):
                 lists[kind] = []
         project = resolve_names(body.get("project") or {}, lists)
         try:
-            built = gb.build_prompt(project, upto=body.get("upto"),
-                                    dry_run=bool(body.get("dry_run")), env=current_env(),
-                                    final=bool(body.get("final")),
-                                    standalone=bool(body.get("standalone")))
+            if isinstance(body.get("take_clips"), list):
+                built = gb.build_take_clips(project, body["take_clips"][:64], env=current_env())
+            else:
+                built = gb.build_prompt(project, upto=body.get("upto"),
+                                        dry_run=bool(body.get("dry_run")), env=current_env(),
+                                        final=bool(body.get("final")),
+                                        standalone=bool(body.get("standalone")),
+                                        clips_for=body.get("clips_for") if isinstance(body.get("clips_for"), list) else None,
+                                        chunk=body.get("chunk") if isinstance(body.get("chunk"), dict) else None)
         except gb.BuildError as err:
             return error(err)
         return web.json_response(built.as_dict())
@@ -694,7 +848,11 @@ def register(routes=None):
 
     @routes.get("/longshot/projects")
     async def projects(request):
-        return web.json_response(project_store().list())
+        import folder_paths
+        inp, out = folder_paths.get_input_directory(), folder_paths.get_output_directory()
+        listing = await asyncio.get_running_loop().run_in_executor(None, lambda: project_store().list(
+            check=lambda slug, p: {"files_missing": pj.files_missing(inp, out, slug, p)}))
+        return web.json_response(listing)
 
     @routes.post("/longshot/projects")
     async def create_project(request):
@@ -760,13 +918,16 @@ def register(routes=None):
         if not slug:
             return error("Not a project slug.", 400)
         segments, inputs = request.query.get("segments") == "1", request.query.get("inputs") == "1"
-        if (segments or inputs) and not local(request):
+        videos = request.query.get("videos") == "1"
+        if (segments or inputs or videos) and not local(request):
             return error("Files can only be deleted from the machine running ComfyUI.", 403)
         out = {"project": project_store().delete(slug)}
         if segments:
             out["segments"] = pj.clear_segments(folder_paths.get_output_directory(), slug)
         if inputs:
             out["inputs"] = pj.delete_inputs(folder_paths.get_input_directory(), slug)
+        if videos:
+            out["videos"] = pj.delete_videos(folder_paths.get_output_directory(), slug)
         return web.json_response(out)
 
     @routes.get("/longshot/inputs")
@@ -1003,10 +1164,12 @@ def register(routes=None):
             return error(err)
         os.makedirs(folder, exist_ok=True)
         select = selectable(folder, body.get("select"))
+        before = explorer_snapshot()
         try:
             launch(open_command(folder, select))
         except Exception as err:
             return error(f"Couldn't open the folder: {err}", 500)
+        bring_to_front(folder, before)
         return web.json_response({"opened": folder, "selected": bool(select)})
 
     @routes.post("/longshot/cleanup-outputs")
@@ -1026,6 +1189,100 @@ def register(routes=None):
             None, pj.remove_render_side_files, folder_paths.get_output_directory(),
             video_entries(outputs), png, noaudio)
         return web.json_response({"removed": removed})
+
+    @routes.post("/longshot/chunks/{slug}/join")
+    async def join_chunks(request):
+        """{prefix, chunks: [{filename, subfolder}], audio, masters}: join the
+        chunks of an upscaled render (pictures copied, not encoded again) and
+        its sound into one video in the project's videos folder."""
+        import folder_paths
+        slug, body = slug_of(request), await body_of(request)
+        if not slug or body is None or not isinstance(body.get("chunks"), list):
+            return error("Send {prefix, chunks, audio, masters}.")
+        ffmpeg = _ffmpeg_path()
+        if not ffmpeg:
+            return error("ffmpeg isn't available, so the chunks can't be joined.", 500)
+        try:
+            out = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: pj.join_chunks(folder_paths.get_output_directory(), slug, body.get("prefix"),
+                                             body["chunks"], body.get("audio"),
+                                             body.get("masters") if isinstance(body.get("masters"), list) else None,
+                                             ffmpeg=ffmpeg))
+        except ValueError as err:
+            return error(err)
+        except Exception as err:
+            return error(str(err), 500)
+        return web.json_response(out)
+
+    @routes.post("/longshot/chunks/{slug}/discard")
+    async def discard_chunks(request):
+        """Remove the chunks of an upscale that was stopped or failed."""
+        import folder_paths
+        slug = slug_of(request)
+        if not slug:
+            return error("Not a project slug.")
+        return web.json_response({"removed": pj.discard_chunks(folder_paths.get_output_directory(), slug)})
+
+    @routes.get("/longshot/clips/{slug}")
+    async def clips(request):
+        import folder_paths
+        slug = slug_of(request)
+        if not slug:
+            return error("Not a project slug.")
+        return web.json_response(pj.clip_index(folder_paths.get_output_directory(), slug),
+                                 headers=no_cache)
+
+    @routes.post("/longshot/clips/{slug}")
+    async def cut_clips(request):
+        """{video: {filename, subfolder}, rows: [{key, start, end}]}: cut each
+        take's piece of a finished render for the timeline (CPU only)."""
+        import folder_paths
+        slug, body = slug_of(request), await body_of(request)
+        if not slug or body is None or not isinstance(body.get("rows"), list):
+            return error("Send {video, rows}.")
+        ffmpeg = _ffmpeg_path()
+        if not ffmpeg:
+            return error("ffmpeg isn't available.", 500)
+
+        def run(cmd):
+            try:
+                return subprocess.run(cmd, capture_output=True, timeout=300,
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                return False
+        try:
+            index = await asyncio.get_running_loop().run_in_executor(
+                None, pj.cut_clips, folder_paths.get_output_directory(), slug, body.get("video") or {},
+                body["rows"][:64], run, ffmpeg)
+        except ValueError as err:
+            return error(err)
+        return web.json_response(index)
+
+    @routes.post("/longshot/clips/{slug}/adopt")
+    async def adopt_clips(request):
+        """{items: [{key, file}]}: clips Video Combine just saved become the timeline's clips."""
+        import folder_paths
+        slug, body = slug_of(request), await body_of(request)
+        if not slug or body is None or not isinstance(body.get("items"), list):
+            return error("Send {items}.")
+        ffmpeg = _ffmpeg_path()
+
+        def probe(path):
+            return probe_video(path).get("duration")
+
+        def thumb(src, dest):
+            if not ffmpeg:
+                return False
+            try:
+                return subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", "0.5",
+                                       "-i", src, "-frames:v", "1", "-vf", "scale=192:-2", "-q:v", "5", dest],
+                                      capture_output=True, timeout=60,
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                return False
+        index = await asyncio.get_running_loop().run_in_executor(
+            None, pj.adopt_clips, folder_paths.get_output_directory(), slug, body["items"][:64], probe, thumb)
+        return web.json_response(index)
 
     @routes.post("/longshot/clear-cache")
     async def clear_cache(request):

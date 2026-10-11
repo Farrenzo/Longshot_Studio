@@ -54,6 +54,9 @@ const S = {
   conn: "connecting", open: null, takes: {}, styleOpen: false, audioOpen: false, advOpen: false, settingsOpen: true, uploading: {},
   busy: null, error: null, loop: false, dry: null, saveState: "",
   refState: {}, refInfo: {}, inputs: null, segStats: null, conflict: null, checkedFor: null,
+  clips: {},       // timeline clips of this project: key -> {dur, made, thumb}
+  clipTried: new Set(),   // takes a clip was already asked for (no endless retries)
+  focus: null,     // the Shot picked on the timeline (review, loop, jump)
   gen: 0,          // bumped by every re-queue rule, so an edited Shot only returns to its take if nothing else changed
   bad: {},         // "<shot id>:<field>" -> the field holds something that isn't a value yet (typing)
 };
@@ -66,9 +69,10 @@ const DEFAULT_SETTINGS = {
   steps: 8, megapixels: 0.6, aspect: "16:9", ref_image_size: "match", ref_resize_px: 1500,
   sampler: "er_sde", scheduler: "beta57", overlap: 22, seed: 1722, seed_mode: "increment",
   shift_video: 12, shift_audio: 3, sage_attention: "auto", save_segments: true,
-  rtx_vsr: { on: false, scale: 2, quality: "ULTRA" },
+  rtx_vsr: { on: false, scale: 2, quality: "ULTRA", chunk_s: 10 },   // chunk_s: upscale a chunk at a time
   save_png: false, save_noaudio: false,      // Video Combine's side files: deleted after each render
   prores_master: false,                      // Upscale final also writes a 10-bit ProRes 422 HQ .mov
+  multi_take: 1,                             // takes per render: the render runs this many times, new seeds
 };
 
 function normalize(p) {
@@ -109,6 +113,10 @@ function normalize(p) {
   s.loras = [0, 1, 2].map((i) => Object.assign({ on: false, name: null, strength: 1.0 }, (s.loras || [])[i] || {}));
   p.settings = s;
   p.last_output = p.last_output || null;
+  // The stitched, decoded video and the plan it shows. Renders now decode each
+  // new take on its own, so the last render's plan and the last video can differ.
+  const lo = p.last_output;
+  if (lo && lo.video && !lo.video_plan) { lo.video_plan = lo.plan; lo.video_chain = lo.chain; }
   p.stats = p.stats || { rate: null, n: 0 };
   return p;
 }
@@ -117,7 +125,10 @@ const active = () => P().shots.filter((s) => !s.bypassed);
 const liveCast = () => P().cast.filter((c) => !c.bypassed);
 const numOf = (id) => active().findIndex((s) => s.id === id) + 1;
 const titleOf = (s) => (s ? "Shot " + numOf(s.id) : "—");
-const reviewShot = () => active().find((s) => s.status === "review");
+const reviewShot = () => {
+  const f = S.focus && active().find((s) => s.id === S.focus && s.status === "review");
+  return f || active().find((s) => s.status === "review");
+};
 const nextQueued = () => active().find((s) => s.status === "queued");
 
 /** The Shot the main button renders: the first queued one, except that a queued
@@ -283,15 +294,16 @@ async function loadProject(slug) {
     toast(`Found ${relinked} model file${relinked > 1 ? "s" : ""} by name in this machine's model folders.`);
   }
   Object.assign(S, { dry: null, error: null, loop: false, conflict: null, refState: {}, refInfo: {},
-    segStats: null, checkedFor: null, takes: {} });
+    segStats: null, checkedFor: null, takes: {}, clips: {}, focus: null, clipTried: new Set(), clipsReady: false });
   $("conflict").hidden = true;
   S.saveState = p.saved_at ? "Saved · " + clock(p.saved_at) : "";
   S.open = (reviewShot() || nextQueued() || {}).id || null;
   store("h3studio.project", P().slug);
   loadVideo();
   render();
-  await Promise.all([loadInputs(), checkInputs(), loadSegStats()]);
+  await Promise.all([loadInputs(), checkInputs(), loadSegStats(), loadClips(), fetchAllTakes()]);
   render();
+  ensureClips();
   autoCheck();
 }
 
@@ -442,7 +454,7 @@ async function loadSegStats() {
  *  come back from disk. Only when ComfyUI is idle, so it never waits in line. */
 async function autoCheck() {
   const p = P();
-  if (!p || S.checkedFor === p.slug || S.busy || S.conn !== "ok") return;
+  if (!p || S.checkedFor === p.slug || S.busy || S.queuing || S.multi || S.chunking || S.conn !== "ok") return;
   const done = active().filter((s) => s.status !== "queued");
   if (!done.length || missingRefs().length) { S.checkedFor = p.slug; return; }
   try {
@@ -620,12 +632,223 @@ function chainEnd(targetId) {
   return act[end].id;
 }
 
-async function queue({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
-  omit = null, trimLeft = false }) {
+/** One job at a time: building a prompt takes a moment, and two jobs started
+ *  together (e.g. the reopen check and a clip job) must not both go out. */
+async function queue(opts) {
+  if (S.busy || S.queuing) return;
+  S.queuing = true;
+  try { return await queueJob(opts); } finally { S.queuing = false; }
+}
+
+// ---------------------------------------------------------------------------
+// Chunked upscale: an upscaled whole-film render (Upscale final video, or
+// Update preview with Upscale previews on) runs once per chunk. The film is
+// decoded as usual (ComfyUI keeps the frames between runs); each run upscales
+// one chunk and saves it without sound, so only one chunk of upscaled frames is
+// in RAM. The server then joins the chunks and the sound (pictures copied).
+// ---------------------------------------------------------------------------
+
+const vsrChunkS = () => {
+  const v = Number((P().settings.rtx_vsr || {}).chunk_s);
+  return v >= 2 && v <= 600 ? v : 10;
+};
+const filmSeconds = () => active().reduce((a, s) => a + ((lastRowFor(s.id) || {}).seconds || Number(s.seconds) || 0), 0);
+
+/** A whole-film job: in chunks when it upscales and the film is longer than one chunk. */
+function wholeQueue(opts) {
+  const v = P().settings.rtx_vsr || {};
+  const upscales = opts.kind === "final" || !!v.on;
+  const J = S.joinPending;
+  if (J && J.slug === P().slug && J.opts.kind === opts.kind) {
+    // the chunks of the last run are all saved; only the join failed: join again
+    S.joinPending = null;
+    J.opts = opts;
+    S.error = null;
+    S.chunking = J;
+    return chunkJoin(J);
+  }
+  S.joinPending = null;
+  if (!upscales || filmSeconds() <= vsrChunkS() + 0.5) return queue(opts);
+  const C = { opts, slug: P().slug, L: Math.max(24, Math.round(vsrChunkS() * FPS)), n: 0, k: 0,
+    files: [], masters: [], audio: null, prefix: null, done: null };
+  S.chunking = C;
+  return chunkRun(C);
+}
+
+async function chunkRun(C) {
+  const i = C.k, o = C.opts;
+  await queue(Object.assign({}, o, {
+    chunk: { index: i, start: i * C.L, length: C.L, audio: i === 0 },
+    label: `${o.label} · chunk ${i + 1}${C.n ? " of " + C.n : ""}`,
+    note: i === 0 ? "Decoding the film, then upscaling it a chunk at a time" : "The decoded film is reused · upscaling the next chunk",
+    onDone: (res) => chunkDone(C, res),
+  }));
+  if (!S.busy && S.chunking === C && C.k === i) chunkEnd(C, false);   // didn't start (S.error says why)
+}
+
+function chunkDone(C, { rows, text, outputs, built, sent }) {
+  const ui = outputs[built.nodes.chunk] || {};
+  const fr = (ui.frame_range || [])[0], v = (ui.chunk_video || [])[0], m = (ui.chunk_master || [])[0];
+  if (!fr || !v) throw new Error("The chunk saved no file. Update H3 Long Shot to 1.6.2 or later.");
+  C.n = Math.max(1, Math.ceil(fr.total / C.L));
+  C.files.push({ filename: v.filename, subfolder: v.subfolder });
+  if (m) C.masters.push({ filename: m.filename, subfolder: m.subfolder });
+  const a = built.nodes.audio_file && ((outputs[built.nodes.audio_file] || {}).longshot_audio || [])[0];
+  if (a) C.audio = { filename: a.filename, subfolder: a.subfolder };
+  C.prefix = built.filename_prefix;
+  C.done = { rows, text, built, sent };
+  C.k++;
+}
+
+async function chunkNext(C, ok) {
+  if (S.chunking !== C) return;
+  if (!ok || !C.done || C.k === 0) { chunkEnd(C, false); return; }
+  if (C.k < C.n) { chunkRun(C); return; }
+  chunkJoin(C);
+}
+
+/** Every chunk is saved: join them with the sound. If that fails the chunks are
+ *  kept, and the same button tries the join again (nothing is upscaled again). */
+async function chunkJoin(C) {
+  C.joining = true;
+  toast(`Joining ${C.n} chunks…`);
+  render();
+  const { rows, text, built, sent } = C.done;
+  try {
+    const out = await api(`/longshot/chunks/${encodeURIComponent(P().slug)}/join`, { method: "POST",
+      body: { prefix: C.prefix, chunks: C.files, audio: C.audio, masters: C.masters } });
+    const outputs = { [built.nodes.combine]: { gifs: [out.video] } };
+    if (built.nodes.prores && out.master) outputs[built.nodes.prores] = { gifs: [out.master] };
+    S.chunking = null;
+    C.opts.onDone({ rows, text, outputs, built, sent });
+  } catch (e) {
+    S.error = `Joining the upscaled chunks failed: ${e.message} The ${C.n} chunks are kept: ` +
+      `click ${C.opts.kind === "final" ? "Upscale final video" : "Update preview"} again to retry the join (nothing is upscaled again).`;
+    if (S.chunking === C) S.chunking = null;
+    C.joining = false;
+    S.joinPending = C;
+    render();
+    return;
+  }
+  render();
+  saveNow();
+  setTimeout(ensureClips, 0);
+}
+
+/** Stopped or failed: nothing half-finished is kept. */
+function chunkEnd(C, ok) {
+  if (S.chunking === C) S.chunking = null;
+  if (!ok) {
+    api(`/longshot/chunks/${encodeURIComponent(P().slug)}/discard`, { method: "POST", body: {} }).catch(() => {});
+    if (!S.error && C.k > 0) toast("The upscale stopped; its chunks were removed.");
+  }
+  render();
+  setTimeout(ensureClips, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-take: a render runs settings.multi_take times in a row (ComfyUI's batch
+// count), each pass with new seeds for the Shots it renders. Every take is kept
+// with its own clip; afterwards each Shot shows take 1 of the batch.
+// ---------------------------------------------------------------------------
+
+const MULTI_MAX = 8;
+const multiTakes = () => Math.max(1, Math.min(MULTI_MAX, Math.round(Number(P() && P().settings.multi_take)) || 1));
+
+/** The warning before a Multi-take render: how many takes (1 = just one), 0 = cancelled. */
+async function askMulti(what) {
+  const n = multiTakes();
+  if (n <= 1) return 1;
+  const ans = await confirmBox({ title: `Multi-take is ${n}`,
+    body: `${what} renders ${n} times, one after another, each time with new seeds, so it takes about ${n}× as long. ` +
+      "Every take is kept. Afterwards each Shot shows take 1 of the batch; review the others with ◀ ▶ on the timeline. " +
+      "Stop ends the batch.",
+    yes: `Render ${n} takes`, alt: "Just 1 take", no: "Cancel" });
+  return ans === true ? n : ans === "alt" ? 1 : 0;
+}
+
+/** Start a render that may repeat: `again` queues one pass (returns queue()'s
+ *  promise); `ids` are the Shots each pass renders. */
+async function multiGo(of, ids, again) {
+  S.multi = of > 1 ? { of, k: 1, ids: ids.slice(), first: {}, again } : null;
+  await again();
+  if (!S.busy && S.multi && S.multi.k === 1) S.multi = null;      // didn't start
+}
+
+const TAKE_FIELDS = ["take", "shot_seed", "window", "take_seconds", "rendered", "standalone", "seam", "edit_from"];
+
+/** A pass finished. Another pass: new seeds for its Shots, render them again
+ *  (true). Last pass: every Shot back on its take 1 (false). */
+function multiNext(ok) {
+  const m = S.multi;
+  if (!m) return false;
+  if (m.k === 1 && ok) {
+    for (const id of m.ids) {
+      const s = P().shots.find((x) => x.id === id);
+      if (s && s.take && s.status !== "queued") m.first[id] = JSON.parse(JSON.stringify(pickFields(s, TAKE_FIELDS)));
+    }
+    m.seams = Object.fromEntries(P().shots.map((s) => [s.id, s.seam === undefined ? null : s.seam]));
+  }
+  if (!ok || m.k >= m.of) { multiEnd(ok); return false; }
+  m.k++;
+  for (const id of m.ids) {
+    const s = P().shots.find((x) => x.id === id);
+    if (!s || s.bypassed || !m.first[id]) continue;
+    rememberTake(s);
+    s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+    s.status = "queued";
+    s.was_approved = s.was_rendered = false;
+    s.edit_from = null;
+  }
+  S.dry = null;
+  commit();
+  setTimeout(async () => {
+    if (S.multi !== m) return;
+    await m.again();
+    if (!S.busy && S.multi === m) multiEnd(false);
+  }, 0);
+  return true;
+}
+
+/** The batch is over (finished, stopped or failed): every Shot it rendered goes
+ *  back to its take 1, under review. The other takes stay in its take list. */
+function multiEnd(ok) {
+  const m = S.multi;
+  S.multi = null;
+  if (!m) return;
+  let firstId = null;
+  for (const id of m.ids) {
+    const s = P().shots.find((x) => x.id === id), t = m.first[id];
+    if (!s || !t) continue;
+    Object.assign(s, JSON.parse(JSON.stringify(t)));
+    if (s.status === "queued") s.status = "review";
+    s.was_approved = s.was_rendered = false;
+    if (!firstId) firstId = id;
+  }
+  // the joins are as they were with the takes of pass 1
+  if (firstId && m.seams) for (const s of P().shots) if (s.id in m.seams) s.seam = m.seams[s.id];
+  S.dry = null;
+  commit();
+  if (firstId) {
+    S.focus = S.open = firstId;
+    loadVideo(undefined, firstId);
+    toast(ok ? `${m.of} takes rendered. Each Shot shows take 1 of the batch; ◀ ▶ on the timeline shows the others.`
+      : `Multi-take stopped after ${Math.max(1, m.k - 1)} of ${m.of}. Each Shot shows take 1 of the batch; ◀ ▶ shows the others.`);
+  }
+}
+
+function pickFields(o, keys) {
+  const r = {};
+  for (const k of keys) r[k] = o[k] === undefined ? null : o[k];
+  return r;
+}
+
+async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
+  omit = null, trimLeft = false, takeClips = null, chunk = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
-  const missing = missingRefs();
+  const missing = kind === "clips" ? [] : missingRefs();
   if (missing.length) {
     S.error = `${missing.length} reference${missing.length > 1 ? "s are" : " is"} missing — relink or bypass ${missing.length > 1 ? "them" : "it"}.`;
     render();
@@ -642,6 +865,7 @@ async function queue({ upto, dry, kind, label, note, onDone, final = false, stan
     if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     return;
   }
+  if (S.multi && (kind === "render" || kind === "reroll")) label += ` · take ${S.multi.k} of ${S.multi.of}`;
   let project = sendable(P());          // seeds are settled on the whole timeline first
   const target = upto;
   if (!standalone && !omit && (kind === "render" || kind === "reroll" || kind === "refresh")) upto = chainEnd(upto);
@@ -664,7 +888,13 @@ async function queue({ upto, dry, kind, label, note, onDone, final = false, stan
   }
   let built;
   try {
-    built = await api("/longshot/build", { method: "POST", body: { project, upto, dry_run: !!dry, final, standalone } });
+    // Renders while reviewing don't decode the stitched film: each Shot that
+    // gets a new take is decoded on its own into its clip (Long Shot 1.6).
+    const clipsFor = !dry && (kind === "render" || kind === "reroll")
+      ? project.shots.filter((x) => !x.bypassed && x.kind !== "clip" && !x.lock).map((x) => x.id) : null;
+    const body = takeClips ? { project, take_clips: takeClips }
+      : { project, upto, dry_run: !!dry, final, standalone, clips_for: clipsFor, chunk };
+    built = await api("/longshot/build", { method: "POST", body });
   } catch (e) {
     S.error = e.message;
     render();
@@ -751,6 +981,8 @@ async function finish(promptId, entry) {
     toast("Stopped. Finished segments stay in Long Shot's memory.");
   } else if (!entry) {
     S.error = "The render finished but ComfyUI's history has no record of it.";
+  } else if (b.kind === "clips") {
+    await adoptClips(Object.entries(b.built.nodes.clips || {}).map(([key, node]) => ({ key, node })), entry.outputs || {});
   } else {
     const outputs = entry.outputs || {};
     let ls = outputs[b.built.nodes.longshot] || {};
@@ -783,6 +1015,19 @@ async function finish(promptId, entry) {
   if (b.kind === "render" || b.kind === "reroll" || b.kind === "final" || b.kind === "refresh") {
     if (!S.error) adoptCurrentFiles();
     if (entry && !failed) await cleanupOutputs(promptId, entry.outputs);
+    if (entry && !failed && b.kind !== "final") {
+      await fetchAllTakes();
+      const lo = last();
+      if (b.built.nodes.clips && lo) {
+        // each new take's own clip: named after its take
+        const items = Object.entries(b.built.nodes.clips).map(([sid, node]) => {
+          const i = lo.chain.indexOf(sid), r = i >= 0 ? lo.plan[i] : null;
+          return r && r.take ? { key: r.take.replace(/\.safetensors$/, ""), node } : null;
+        }).filter(Boolean);
+        await adoptClips(items, entry.outputs || {});
+      }
+      renderViewer();
+    }
     loadSegStats().then(renderSettings);
     saveNow();                       // save right after every finished render
   } else scheduleSave();
@@ -796,19 +1041,58 @@ async function finish(promptId, entry) {
       setTimeout(() => renderAlone(P().shots.find((x) => x.id === rest[0]), { ids: rest.slice(1), of: b.batch.of }), 0);
     } else if (!ok && rest.length) toast(`Render odd Shots stopped; ${rest.length} Shot${rest.length > 1 ? "s" : ""} still to render.`);
   }
-  // A Shot rendered on its own shows alone; once the run is over, the preview
-  // shows every rendered Shot back to back so each one can be reviewed.
-  if (ok && b.standalone && !more && active().filter(isRendered).length > 1) setTimeout(() => stitchPreview(b.target), 0);
+  // Chunked upscale: the next chunk, or join them
+  if (!more && S.chunking && (b.kind === "final" || b.kind === "refresh")) {
+    more = true;
+    const C = S.chunking;
+    setTimeout(() => chunkNext(C, ok), 0);
+  }
+  // Multi-take: the next pass, or every Shot back on take 1 of the batch
+  if (!more && S.multi && (b.kind === "render" || b.kind === "reroll")) more = multiNext(ok);
+  if (!more) setTimeout(ensureClips, 0);           // takes still without a clip get one
+}
+
+/** "Update preview" under the timeline: the exact video of every rendered Shot
+ *  (Shots not rendered yet left out). Nothing is sampled. */
+function updatePreview() {
+  if (busyGuard()) return;
+  stitchPreview(S.focus, true);
+}
+
+/** Item 3 (round 5): every rendered Shot back to "not rendered". */
+function clearFields(s) {
+  Object.assign(s, { status: "queued", take: null, rendered: null, edit_from: null, standalone: false,
+    seam: null, was_approved: false, was_rendered: false, cleared: true });
+}
+
+async function clearAll() {
+  if (busyGuard()) return;
+  const list = active().filter((s) => s.kind !== "clip" && s.status !== "queued");
+  if (!list.length) { toast("Nothing is rendered."); return; }
+  const ans = await confirmBox({ title: `Clear all ${list.length} rendered Shot${list.length > 1 ? "s" : ""}?`,
+    body: "Every Shot goes back to not rendered and keeps its prompt, length and seed. Takes stay in Take history. " +
+      "With the same seeds, rendering again brings the same takes back from disk in moments.",
+    yes: "Clear all", no: "Cancel", check: "Give every Shot a new random seed" });
+  if (!ans || !ans.ok) return;
+  for (const s of list) clearFields(s);
+  if (ans.checked) {
+    for (const s of active()) if (s.kind !== "clip") { rememberTake(s); s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1)); }
+  }
+  S.gen++;
+  S.dry = null;
+  S.focus = null;
+  commit();
+  toast(`Cleared ${list.length} Shot${list.length > 1 ? "s" : ""}` + (ans.checked ? " and gave every Shot a new seed." : ". Their takes stay in Take history."));
 }
 
 /** Item 3: the preview from every rendered Shot, in order, with the Shots not
  *  rendered yet left out (hard cuts there). Every Shot loads its take. */
-function stitchPreview(focusId) {
-  if (S.busy || !P()) return;
+function stitchPreview(focusId, force = false) {
+  if (S.busy || S.chunking || !P()) return;
   const act = active(), done = act.filter(isRendered);
-  if (done.length < 2) return;
+  if (done.length < (force ? 1 : 2)) return;
   const gaps = act.filter((x) => !isRendered(x)).map((x) => x.id);
-  queue({ upto: done[done.length - 1].id, kind: "refresh", omit: gaps,
+  wholeQueue({ upto: done[done.length - 1].id, kind: "refresh", omit: gaps,
     label: "Updating the preview · rendered Shots back to back",
     note: gaps.length ? "Nothing is sampled · Shots not rendered yet are left out" : "Nothing is sampled",
     onDone: onRendered(null, false, { gaps: gaps.length > 0, focus: focusId }) });
@@ -853,9 +1137,9 @@ function adoptRows(rows, sent, standalone = false) {
 
 function onRendered(targetId, standalone = false, opts = {}) {
   return ({ rows, text, outputs, built, sent }) => {
-    const combine = outputs[built.nodes.combine] || {};
-    const video = (combine.gifs || combine.videos || [])[0];
-    if (!video) throw new Error("Video Combine saved no file.");
+    const combine = built.nodes.combine ? outputs[built.nodes.combine] || {} : null;
+    const video = combine ? (combine.gifs || combine.videos || [])[0] : null;
+    if (combine && !video) throw new Error("Video Combine saved no file.");
     adoptRows(rows, sent, standalone);
     if (!opts.gaps) noteSeams(rows, built.chain, standalone);    // joins next to a left-out gap aren't real
     for (const s of P().shots) {
@@ -873,14 +1157,16 @@ function onRendered(targetId, standalone = false, opts = {}) {
       s.status = "queued";
     }
     const at = new Date().toISOString();
-    P().last_output = { video, plan: rows, chain: built.chain, text,
-      size: [built.width, built.height], at, source_at: at };
-    P().preview_dirty = false;
+    const prev = P().last_output || {};
+    P().last_output = { video: video || prev.video || null, plan: rows, chain: built.chain, text,
+      size: [built.width, built.height], at, source_at: at,
+      video_plan: video ? rows : prev.video_plan || null, video_chain: video ? built.chain : prev.video_chain || null };
+    if (video) P().preview_dirty = false;
     S.dry = null;
     if (targetId) S.open = targetId;
     const focus = targetId || opts.focus;
-    const row = focus && built.chain.includes(focus) ? rows[built.chain.indexOf(focus)] : null;
-    loadVideo(row ? row.start + 0.04 : video.currentTime || 0);
+    if (focus) S.focus = focus;
+    loadVideo(undefined, focus);
     const cuts = rows.filter((r) => r.seam === "mismatch").map((r) => r.index);
     if (cuts.length) {
       toast(`Hard cut before Shot ${cuts.join(", ")}: it was continued from a different take. ` +
@@ -895,15 +1181,15 @@ function previewStale() {
   const lo = last();
   const done = active().filter(isRendered);
   if (!lo || !done.length || active().some((s) => s.status === "queued")) return false;
-  if (P().preview_dirty) return true;
-  const shown = lo.plan.map((r) => r.kind === "clip" ? `${r.id}:clip` : `${r.id || ""}:${r.take || ""}`).join("|");
+  if (P().preview_dirty || !lo.video_plan) return true;
+  const shown = lo.video_plan.map((r, i) => r.kind === "clip" ? `${lo.video_chain[i]}:clip` : `${lo.video_chain[i] || ""}:${r.take || ""}`).join("|");
   return shown !== done.map((s) => s.kind === "clip" ? `${s.id}:clip` : `${s.id}:${s.take}`).join("|");
 }
 
 function refreshPreview() {
   const done = active().filter(isRendered);
-  if (!done.length || S.busy) return;
-  queue({ upto: done[done.length - 1].id, kind: "refresh", label: "Updating the preview",
+  if (!done.length || S.busy || S.chunking) return;
+  wholeQueue({ upto: done[done.length - 1].id, kind: "refresh", label: "Updating the preview",
     note: "Every Shot loads its take · nothing is sampled", onDone: onRendered(null) });
 }
 
@@ -915,23 +1201,24 @@ async function primary() {
     if (!mode || S.busy) return;
     alone = mode === "alone";
   }
+  const takes = nx0 ? await askMulti(titleOf(nx0)) : 1;
+  if (!takes || S.busy) return;
   const rv = reviewShot(), nx = nextToRender();
   if (rv !== rv0 || nx !== nx0) return;        // something changed while the dialog was open
   if (rv) { rv.status = "approved"; rv.was_approved = false; }
-  if (!nx && previewStale()) { refreshPreview(); return; }
   if (!nx) { scheduleSave(); render(); return; }
-  if (nx.standalone && alone) { renderAlone(nx); return; }
+  if (nx.standalone && alone) { multiGo(takes, [nx.id], () => renderAlone(nx)); return; }
   const n = numOf(nx.id);
   if (nx.standalone) {
-    queue({ upto: nx.id, kind: "render", trimLeft: true, label: `Rendering Shot ${n} · ${pinnedNote(nx)}`,
-      note: "In place · the Shots around it keep their takes", onDone: onRendered(nx.id) });
+    multiGo(takes, [nx.id], () => queue({ upto: nx.id, kind: "render", trimLeft: true, label: `Rendering Shot ${n} · ${pinnedNote(nx)}`,
+      note: "In place · the Shots around it keep their takes", onDone: onRendered(nx.id) }));
     return;
   }
   const others = active().filter((x) => x !== nx && isRendered(x)).length;
-  queue({ upto: nx.id, kind: "render", label: "Rendering Shot " + n,
+  multiGo(takes, [nx.id], () => queue({ upto: nx.id, kind: "render", label: "Rendering Shot " + n,
     note: others ? `${others} Shot${others > 1 ? "s" : ""} load${others > 1 ? "" : "s"} ${others > 1 ? "their" : "its"} take · only Shot ${n} renders`
       : n > 1 ? `Shots 1–${n - 1} reused · only Shot ${n} renders` : "Rendering Shot 1",
-    onDone: onRendered(nx.id) });
+    onDone: onRendered(nx.id) }));
 }
 
 async function reroll() {
@@ -943,14 +1230,16 @@ async function reroll() {
     if (!mode || S.busy || reviewShot() !== rv) return;
     alone = mode === "alone";
   }
+  const takes = await askMulti(titleOf(rv));
+  if (!takes || S.busy || reviewShot() !== rv) return;
   rememberTake(rv);
   rv.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
   rv.status = "queued";
-  const n = numOf(rv.id);
-  queue({ upto: rv.id, kind: "reroll", standalone: alone, trimLeft: !alone,
-    label: `Re-rolling Shot ${n}${alone ? " on its own" : rv.standalone ? " · " + pinnedNote(rv) : ""} · seed ${rv.shot_seed}`,
+  const n = numOf(rv.id), pinned = !alone && rv.standalone ? " · " + pinnedNote(rv) : "";
+  multiGo(takes, [rv.id], () => queue({ upto: rv.id, kind: "reroll", standalone: alone, trimLeft: !alone,
+    label: `Re-rolling Shot ${n}${alone ? " on its own" : pinned} · seed ${rv.shot_seed}`,
     note: alone ? "A fresh start · no pins to the Shots around it" : "Every other Shot keeps its take",
-    onDone: onRendered(rv.id, alone) });
+    onDone: onRendered(rv.id, alone) }));
 }
 
 /** Shots the panel buttons would render: not rendered yet, generated, active. */
@@ -960,25 +1249,48 @@ const oddToRender = () => toRender().filter((s) => numOf(s.id) % 2 === 1);
 /** ▶ Render all: one run through every Shot not rendered yet, each continued
  *  from the Shot before it (the standard workflow). Rendered Shots keep their
  *  takes, so gaps between them render as bridges. All land under review. */
-function renderAll() {
+async function renderAll() {
   if (busyGuard()) return;
   const list = toRender();
   if (!list.length) { toast("Every Shot is rendered."); return; }
+  const takes = await askMulti(`Render all (${list.length} Shot${list.length > 1 ? "s" : ""})`);
+  if (!takes || S.busy) return;
   const lastOne = list[list.length - 1];
-  const others = active().filter((x) => isRendered(x)).length;
-  queue({ upto: lastOne.id, kind: "render", label: `Rendering all · ${list.length} Shot${list.length > 1 ? "s" : ""}`,
+  const others = active().filter((x) => isRendered(x) && !list.includes(x)).length;
+  multiGo(takes, list.map((x) => x.id), () => queue({ upto: lastOne.id, kind: "render", label: `Rendering all · ${list.length} Shot${list.length > 1 ? "s" : ""}`,
     note: others ? `${others} rendered Shot${others > 1 ? "s keep their takes" : " keeps its take"} · each new Shot continues from the one before`
       : "Each Shot continues from the one before",
-    onDone: onRendered(lastOne.id) });
+    onDone: (args) => {
+      onRendered(lastOne.id)(args);
+      // review from the first Shot that rendered
+      S.focus = list[0].id;
+      S.open = list[0].id;
+      loadVideo(undefined, list[0].id);
+    } }));
 }
 
 /** ▶ Render odd Shots: Shots 1, 3, 5… not rendered yet, each on its own, one
  *  render after another. Then Render all (or the main button) bridges the gaps. */
-function renderOdd() {
+async function renderOdd() {
   if (busyGuard()) return;
   const list = oddToRender();
   if (!list.length) { toast("Every odd Shot is rendered."); return; }
-  renderAlone(list[0], { ids: list.slice(1).map((x) => x.id), of: list.length });
+  const takes = await askMulti(`Render odd Shots (${list.length} Shot${list.length > 1 ? "s" : ""})`);
+  if (!takes || S.busy) return;
+  const ids = list.map((x) => x.id);
+  multiGo(takes, ids, () => {
+    // each pass: the same odd Shots, one after another
+    const now = ids.map((id) => P().shots.find((x) => x.id === id)).filter((x) => x && !x.bypassed && x.status === "queued");
+    return now.length ? renderAlone(now[0], { ids: now.slice(1).map((x) => x.id), of: now.length }) : null;
+  });
+}
+
+/** ▶ on a Shot card: render it on its own (Multi-take asks first). */
+async function renderAloneAction(s) {
+  if (!s || s.kind === "clip" || s.bypassed || busyGuard()) return;
+  const takes = await askMulti(titleOf(s));
+  if (!takes || S.busy) return;
+  multiGo(takes, [s.id], () => renderAlone(s));
 }
 
 /** Item 4 (round 5): a standalone Shot re-rendering next to rendered Shots —
@@ -1010,9 +1322,7 @@ function pinnedNote(s) {
  *  The take stays on disk, in Take history. */
 function clearRender(s) {
   if (!s || s.kind === "clip" || busyGuard() || s.status === "queued") return;
-  Object.assign(s, { status: "queued", take: null, rendered: null, edit_from: null, standalone: false,
-    seam: null, was_approved: false, was_rendered: false, cleared: true });
-  delete S.takes[s.id];
+  clearFields(s);
   S.gen++;
   S.dry = null;
   commit();
@@ -1028,7 +1338,7 @@ function renderAlone(s, batch = null) {
   if (!s || s.kind === "clip" || s.bypassed || S.busy) return;
   const n = numOf(s.id);
   const step = batch ? ` · ${batch.of - batch.ids.length} of ${batch.of}` : "";
-  queue({ upto: s.id, kind: "render", standalone: true, batch, label: `Rendering Shot ${n} on its own${step}`,
+  return queue({ upto: s.id, kind: "render", standalone: true, batch, label: `Rendering Shot ${n} on its own${step}`,
     note: "A fresh start from the references · no pins to the Shots around it",
     onDone: onRendered(s.id, true) });
 }
@@ -1155,83 +1465,319 @@ function viewURL(f) {
     encodeURIComponent(f.subfolder || "") + "&type=" + encodeURIComponent(f.type || "output");
 }
 
-function loadVideo(at) {
-  const lo = last();
-  if (!lo || !lo.video) {
-    video.removeAttribute("src");
-    video.load();
-    renderViewer();
-    return;
+// ---------------------------------------------------------------------------
+// Timeline player (round 5). The timeline is every active Shot in order.
+// When the last preview video is exactly that timeline, it plays that video
+// (exact joins). Otherwise each Shot plays its take's clip — cut on the CPU
+// from the render that made it — so switching takes never decodes anything;
+// Shots not rendered yet are dark gaps of their length.
+// ---------------------------------------------------------------------------
+
+let TL = { exact: false, entries: [], total: 0, sig: "" };
+const PL = { t: 0, playing: false, src: null, k: -1, gapT: 0, gapWall: 0 };
+const shotById = (id) => P().shots.find((x) => x.id === id);
+
+/** A take's (or a Clip Shot's trimmed piece's) clip name on disk. */
+function clipKey(s) {
+  if (!s) return null;
+  if (s.kind === "clip") {
+    return `clipshot__${s.id}__${Math.round((Number(s.clip.trim_in) || 0) * 1000)}_${s.clip.frames || 0}`
+      .replace(/[^A-Za-z0-9_-]/g, "_");
   }
-  const url = viewURL(lo.video);
-  if (lo.size) $("screen").style.aspectRatio = lo.size[0] + " / " + lo.size[1];
-  video.src = url + "&t=" + Date.now();
-  $("download").href = url;
-  $("download").setAttribute("download", lo.video.filename);
-  video.addEventListener("loadedmetadata", () => {
-    if (at !== undefined) video.currentTime = Math.min(at, video.duration || at);
-    renderViewer();
-  }, { once: true });
+  return s.take ? s.take.replace(/\.safetensors$/, "") : null;
+}
+function clipFile(key, ext) {
+  const c = S.clips[key] || {};
+  return `/view?filename=${encodeURIComponent(key + ext)}&subfolder=${encodeURIComponent("longshot/" + P().slug + "/clips")}` +
+    `&type=output&v=${encodeURIComponent(c.made || "")}`;
+}
+
+async function loadClips() {
+  S.clipsReady = false;
+  try { S.clips = await api("/longshot/clips/" + P().slug) || {}; S.clipsReady = true; } catch (e) { S.clips = {}; }
+}
+
+/** Every Shot's takes in one call (the timeline shows ◀ ▶ under each block). */
+async function fetchAllTakes() {
+  if (!P()) return;
+  let list = [];
+  try { list = (await api(`/longshot/takes/${encodeURIComponent(P().slug)}`)).takes || []; } catch (e) { return; }
+  const by = {};
+  for (const t of list) {
+    const id = t.name.split("__").slice(0, -2).join("__");
+    (by[id] = by[id] || []).push(t);
+  }
+  for (const s of P().shots) if (s.kind !== "clip") S.takes[s.id] = by[s.id.replace(/[^A-Za-z0-9_-]+/g, "_")] || [];
+}
+
+/** Clips Video Combine just saved (one per take) become the timeline's clips. */
+async function adoptClips(items, outputs) {
+  const list = items.map(({ key, node }) => {
+    const o = outputs[node] || {};
+    const file = (o.gifs || o.videos || [])[0];
+    return file ? { key, file } : null;
+  }).filter(Boolean);
+  if (!list.length) return;
+  try {
+    S.clips = await api(`/longshot/clips/${P().slug}/adopt`, { method: "POST", body: { items: list } }) || S.clips;
+  } catch (e) { toast("Couldn't keep the clips: " + e.message); }
   renderViewer();
 }
 
-function totalSeconds() {
-  const lo = last();
-  if (video.duration && isFinite(video.duration)) return video.duration;
-  return lo && lo.plan.length ? lo.plan[lo.plan.length - 1].end : 0;
+const takeStem = (name) => (name || "").replace(/\.safetensors$/, "");
+
+/** Decode takes on their own into clips (nothing samples, nothing is stitched). */
+async function makeClips(takes) {
+  const list = takes.filter((t) => t && t.take && !S.clips[takeStem(t.take)]).slice(0, 24);
+  if (!list.length || S.busy || S.queuing || !S.clipsReady) return;
+  list.forEach((t) => S.clipTried.add(t.take));
+  await queue({ kind: "clips", takeClips: list.map((t) => ({ key: takeStem(t.take), take: t.take })),
+    label: `Making clip${list.length > 1 ? "s" : ""} · ${list.length} take${list.length > 1 ? "s" : ""}`,
+    note: "Each take decoded on its own · nothing is sampled", onDone: () => {} });
+  // it didn't start (ComfyUI busy, another job first…): try again later
+  if (!S.busy || S.busy.kind !== "clips") list.forEach((t) => S.clipTried.delete(t.take));
 }
 
-/** Loop range: halfway into the previous Shot → end of the Shot under review. */
+/** The takes the timeline shows always get a clip (older takes, take switches). */
+function ensureClips() {
+  if (!P() || S.busy || S.queuing || S.chunking || S.conn !== "ok" || !S.clipsReady) return;
+  const need = active().filter((s) => s.kind !== "clip" && isRendered(s) && s.take &&
+    !S.clips[takeStem(s.take)] && !S.clipTried.has(s.take)).map((s) => ({ take: s.take }));
+  if (need.length) makeClips(need);
+}
+
+/** Takes in Take history without a clip (made before 0.6.5). */
+function takesWithoutClips() {
+  const out = [];
+  for (const s of active()) {
+    if (s.kind === "clip") continue;
+    for (const t of S.takes[s.id] || []) if (!S.clips[takeStem(t.name)]) out.push({ take: t.name });
+  }
+  return out;
+}
+
+function buildTL() {
+  const lo = last(), act = P() ? active() : [];
+  const loUrl = lo && lo.video ? viewURL(lo.video) : null;
+  const vplan = lo && lo.video_plan, vchain = lo && lo.video_chain;
+  const rowOf = (s) => {           // this Shot's piece of the stitched video, when it shows its take
+    if (!vplan || !vchain || !isRendered(s)) return null;
+    const i = vchain.indexOf(s.id);
+    const r = i >= 0 ? vplan[i] : null;
+    return r && (s.kind === "clip" || r.take === s.take) ? r : null;
+  };
+  const exact = !!loUrl && !!vplan && !!vchain && act.length > 0 && act.length === vchain.length &&
+    act.every((s, i) => vchain[i] === s.id && !!rowOf(s));
+  const half = (Number(P() && P().settings.overlap) || 22) / 24 / 2;
+  const entries = [];
+  for (const s of act) {
+    const r = rowOf(s), key = s.kind !== "clip" && isRendered(s) ? takeStem(s.take) : null;
+    const c = key ? S.clips[key] : null;
+    let e;
+    if (exact) e = { src: loUrl, off: r.start, dur: r.end - r.start, kind: "video" };
+    else if (s.kind === "clip" && s.clip.file) {
+      e = { src: viewURL({ filename: s.clip.file, subfolder: s.clip.subfolder, type: "input" }),
+        off: Number(s.clip.trim_in) || 0, dur: (s.clip.frames || 24) / 24, kind: "source" };
+    } else if (c && c.dur > 0) e = { src: clipFile(key, ".mp4"), off: 0, dur: c.dur, kind: "take" };
+    else if (r && loUrl) e = { src: loUrl, off: r.start, dur: r.end - r.start, kind: "video" };
+    else e = { src: null, off: 0, dur: Math.max(0.5, Number(s.seconds) || 1), kind: "gap" };
+    e.thumb = c && c.thumb ? clipFile(key, ".jpg") : null;
+    Object.assign(e, { id: s.id, rendered: isRendered(s), noclip: isRendered(s) && !e.src, join: s.join });
+    entries.push(e);
+  }
+  if (!exact) {
+    // A take's clip is its whole window, overlap included: at a join between two
+    // takes each gives up half of the shared frames, so the length matches the film.
+    for (let i = 1; i < entries.length; i++) {
+      const a = entries[i - 1], b = entries[i];
+      if (a.kind !== "take" || b.kind !== "take" || b.join === "cut") continue;
+      const h = Math.min(half, a.dur / 3, b.dur / 3);
+      a.dur -= h;
+      b.off += h;
+      b.dur -= h;
+    }
+  }
+  let t = 0;
+  for (const e of entries) {
+    e.start = exact ? e.off : t;
+    t = e.start + e.dur;
+  }
+  const sig = JSON.stringify(entries.map((e) => [e.id, e.src, e.off, e.dur]));
+  const changed = sig !== TL.sig;
+  TL = { exact, entries, total: t, sig };
+  return changed;
+}
+
+const totalSeconds = () => TL.total;
+
+function entryAt(t) {
+  let k = -1;
+  TL.entries.forEach((e, i) => { if (k < 0 || t >= e.start - 1e-6) k = i; });
+  return k;
+}
+
+function tlTime() {
+  const e = TL.entries[PL.k];
+  if (!e) return PL.t;
+  if (e.src && PL.src === e.src && video.readyState >= 1) return Math.min(e.start + e.dur, e.start + Math.max(0, video.currentTime - e.off));
+  if (!e.src && PL.playing) return PL.gapT + (performance.now() - PL.gapWall) / 1000;
+  return PL.t;
+}
+
+function showEntry(e) {
+  const any = TL.entries.some((x) => x.src);
+  video.style.visibility = e && e.src ? "visible" : "hidden";
+  $("placeholder").hidden = !!(e && e.src);
+  const sh = e && shotById(e.id);
+  $("ph-shot").textContent = !any || !sh ? "Nothing rendered yet"
+    : e.noclip ? `${titleOf(sh)} · making this take's clip…` : `${titleOf(sh)} · not rendered yet`;
+}
+
+function safePlay() {
+  const p = video.play();
+  if (p && p.catch) p.catch(() => { /* reported by the error handler */ });
+}
+
+/** Go to timeline time t (seconds). */
+function tlSeek(t) {
+  t = Math.max(0, Math.min(TL.total || 0, Number(t) || 0));
+  PL.t = t;
+  PL.k = entryAt(t);
+  const e = TL.entries[PL.k];
+  showEntry(e);
+  if (e && e.src) {
+    const at = e.off + (t - e.start);
+    PL.at = at;                                    // the latest target wins once the file loads
+    if (PL.src !== e.src) {
+      PL.src = e.src;
+      video.src = e.src;
+      video.addEventListener("loadedmetadata", () => {
+        if (PL.src !== e.src) return;
+        video.currentTime = Math.min(PL.at, video.duration || PL.at);
+        if (PL.playing) safePlay();
+        layoutStage();
+      }, { once: true });
+    } else if (video.readyState >= 1) {
+      video.currentTime = at;
+      if (PL.playing && video.paused) safePlay();
+    }
+  } else {
+    video.pause();
+    PL.gapT = t;
+    PL.gapWall = performance.now();
+  }
+  updateTime();
+}
+
+function play() {
+  if (!TL.entries.length) return;
+  if (tlTime() >= TL.total - 0.05) tlSeek(0);
+  PL.playing = true;
+  setPlayIcon(true);
+  $("play").setAttribute("aria-label", "Pause");
+  stopPreview();
+  const e = TL.entries[PL.k];
+  if (e && e.src) safePlay();
+  else { PL.gapT = PL.t; PL.gapWall = performance.now(); }
+  cancelAnimationFrame(rafId);
+  rafId = requestAnimationFrame(tick);
+}
+
+function pausePlayer() {
+  PL.t = tlTime();
+  PL.playing = false;
+  video.pause();
+  setPlayIcon(false);
+  $("play").setAttribute("aria-label", "Play");
+  updateTime();
+}
+
+function togglePlay() {
+  if (!TL.entries.some((e) => e.src)) return;
+  if (PL.playing) pausePlayer(); else play();
+}
+
+function nextEntry() {
+  const e = TL.entries[PL.k], n = TL.entries[PL.k + 1];
+  if (!n) { pausePlayer(); PL.t = TL.total; updateTime(); return; }
+  if (e && n.src && n.src === e.src && PL.src === n.src && Math.abs(n.off - (e.off + e.dur)) < 0.05) {
+    PL.k++;                                       // the same video file just continues
+    showEntry(n);
+  } else tlSeek(n.start);
+}
+
+function tick() {
+  if (!PL.playing) return;
+  const e = TL.entries[PL.k];
+  const t = tlTime();
+  const L = S.loop ? loopRange() : null;
+  if (L && (t >= L.b - 0.02 || t < L.a - 0.1)) tlSeek(L.a);
+  else if (e && t >= e.start + e.dur - 0.02) nextEntry();
+  else PL.t = t;
+  updateTime();
+  rafId = requestAnimationFrame(tick);
+}
+
+/** Loop range: halfway into the Shot before → end of the Shot picked on the
+ *  timeline (or under review). */
+function loopRange() {
+  const sh = (S.focus && active().find((x) => x.id === S.focus && isRendered(x))) || reviewShot();
+  if (!sh) return null;
+  const k = TL.entries.findIndex((e) => e.id === sh.id);
+  const e = TL.entries[k];
+  if (!e || !e.src) return null;
+  const pe = TL.entries[k - 1], prev = pe && pe.src ? pe : null;
+  return { a: prev ? prev.start + prev.dur / 2 : e.start, b: e.start + e.dur, i: k, prev: !!prev,
+    prevTitle: prev ? titleOf(shotById(prev.id)) : "", shot: sh };
+}
+
 /** The Shot number of the i-th piece of a preview (a stitched preview skips Shots). */
 function rowNum(lo, i) {
   const n = lo && lo.chain ? numOf(lo.chain[i]) : 0;
   return n > 0 ? n : i + 1;
 }
 
-function loopRange() {
-  const lo = last(), rv = reviewShot();
-  if (!lo || !rv) return null;
-  const i = lo.chain.indexOf(rv.id);
-  if (i < 0) return null;
-  // the half of the Shot before only when it really is the Shot before (not across a left-out gap)
-  const act = active(), before = act[act.indexOf(rv) - 1];
-  const row = lo.plan[i], prev = i > 0 && before && lo.chain[i - 1] === before.id ? lo.plan[i - 1] : null;
-  return { a: prev ? prev.start + prev.seconds / 2 : row.start, b: row.end, i, prev: !!prev,
-    prevTitle: prev ? titleOf(before) : "" };
-}
-
-function shotAt(t) {
-  const lo = last();
-  if (!lo) return -1;
-  let idx = 0;
-  lo.plan.forEach((r, k) => { if (t >= r.start - 1e-6) idx = k; });
-  return idx;
-}
-
-function tick() {
-  const t = video.currentTime || 0;
-  if (S.loop) {
-    const L = loopRange();
-    if (L && (t >= L.b - 0.02 || t < L.a - 0.1)) video.currentTime = L.a;
-  }
-  updateTime();
-  if (!video.paused) rafId = requestAnimationFrame(tick);
-}
-
 function updateTime() {
-  const t = video.currentTime || 0, total = totalSeconds();
-  const lo = last();
+  const t = PL.playing ? tlTime() : PL.t, total = TL.total;
   $("scrub").value = String(t);
-  const i = shotAt(t);
-  $("tc-overlay").textContent = (lo && i >= 0 ? "S" + rowNum(lo, i) + " · " : "") + fmt(t);
+  const e = TL.entries[entryAt(t)];
+  $("tc-overlay").textContent = (e ? "S" + numOf(e.id) + " · " : "") + fmt(t);
   $("tc-label").textContent = fmt(t) + " / " + fmt(total);
 }
 
-video.addEventListener("play", () => { $("play").setAttribute("aria-label", "Pause"); setPlayIcon(true); cancelAnimationFrame(rafId); rafId = requestAnimationFrame(tick); });
-video.addEventListener("pause", () => { $("play").setAttribute("aria-label", "Play"); setPlayIcon(false); updateTime(); });
+/** Pick a Shot on the timeline: jump there; it's the one Approve, Reroll and Loop act on. */
+function focusShot(id) {
+  const e = TL.entries.find((x) => x.id === id);
+  S.focus = id;
+  S.open = id;
+  if (e) { if (PL.playing) pausePlayer(); tlSeek(e.start + 0.04); }
+  renderShots();
+  renderDecision();
+  renderViewer();
+}
+
+/** (Re)load the timeline: at time `at`, or at the start of Shot focusId. */
+function loadVideo(at, focusId) {
+  const lo = last();
+  if (lo && lo.size) $("screen").style.aspectRatio = lo.size[0] + " / " + lo.size[1];
+  if (lo && lo.video) {
+    $("download").href = viewURL(lo.video);
+    $("download").setAttribute("download", lo.video.filename);
+  }
+  if (PL.playing) pausePlayer();
+  buildTL();
+  PL.src = null;                                   // the file may be new: load it again
+  if (!TL.entries.some((e) => e.src)) { video.removeAttribute("src"); video.load(); }
+  let t = at !== undefined ? at : PL.t;
+  const fe = focusId && TL.entries.find((e) => e.id === focusId);
+  if (fe) t = fe.start + 0.04;
+  renderViewer();
+  tlSeek(t);
+}
+
 video.addEventListener("seeked", updateTime);
-video.addEventListener("ended", () => { if (S.loop) { const L = loopRange(); if (L) { video.currentTime = L.a; play(); } } });
-$("scrub").addEventListener("input", (e) => { video.currentTime = parseFloat(e.target.value) || 0; updateTime(); });
+video.addEventListener("ended", () => { if (PL.playing) nextEntry(); });
+$("scrub").addEventListener("input", (e) => { tlSeek(parseFloat(e.target.value) || 0); });
 
 function setPlayIcon(playing) {
   $("play-icon").innerHTML = playing
@@ -1285,15 +1831,6 @@ $("volume").addEventListener("input", (e) => {
   renderVolume();
 });
 
-function play() {
-  const p = video.play();
-  if (p && p.catch) p.catch(() => { /* reported by the error handler */ });
-}
-
-function togglePlay() {
-  if (!video.src) return;
-  if (video.paused) play(); else video.pause();
-}
 
 video.addEventListener("error", () => {
   if (!video.getAttribute("src")) return;
@@ -1302,10 +1839,9 @@ video.addEventListener("error", () => {
 });
 
 function stepFrame(dir) {
-  if (!video.src) return;
-  video.pause();
-  video.currentTime = Math.max(0, Math.min(totalSeconds(), (video.currentTime || 0) + dir / FPS));
-  updateTime();
+  if (!TL.entries.some((e) => e.src)) return;
+  pausePlayer();
+  tlSeek(PL.t + dir / FPS);
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,7 +1943,19 @@ function fileOptions(list, current, blank) {
   if (twin) current = twin;
   let out = blank ? `<option value="">${esc(blank)}</option>` : "";
   if (current && !items.includes(current)) out += `<option value="${esc(current)}" selected>${esc(current)} (missing)</option>`;
-  out += items.map((f) => `<option value="${esc(f)}"${f === current ? " selected" : ""}>${esc(f)}</option>`).join("");
+  // grouped by subfolder: "H3", "H3 / Speed"…, each line just the file name
+  const groups = new Map();
+  for (const f of items) {
+    const parts = f.split(/[\\/]/), name = parts.pop(), folder = parts.join(" / ");
+    if (!groups.has(folder)) groups.set(folder, []);
+    groups.get(folder).push([f, name]);
+  }
+  const opt = ([f, name]) => `<option value="${esc(f)}" title="${esc(f)}"${f === current ? " selected" : ""}>${esc(name)}</option>`;
+  if (groups.size === 1 && groups.has("")) return out + groups.get("").map(opt).join("");
+  const order = [...groups.keys()].sort((x, y) => (y === "") - (x === "") || x.localeCompare(y, undefined, { sensitivity: "base" }));
+  for (const folder of order) {
+    out += `<optgroup label="${esc(folder || "Top level")}">${groups.get(folder).map(opt).join("")}</optgroup>`;
+  }
   return out;
 }
 
@@ -1624,6 +2172,7 @@ function renderShots() {
   $("render-all").disabled = off || !nAll;
   $("render-odd").textContent = `▶ Render odd Shots${nOdd ? ` (${nOdd})` : ""}`;
   $("render-odd").disabled = off || !nOdd;
+  $("clear-all").disabled = !!S.busy || !active().some((s) => s.kind !== "clip" && s.status !== "queued");
   const first = $("add-first");
   first.hidden = !P().shots.length;
   first.innerHTML = `${PLUS} Add shot before Shot 1`;
@@ -1657,22 +2206,43 @@ function clipCard(s) {
 }
 
 function renderViewer() {
+  if (!P()) return;
+  if (buildTL()) tlSeek(PL.t);                    // takes / renders changed: same time, new pieces
+  const has = TL.entries.some((e) => e.src);
   const lo = last();
-  const has = !!(lo && lo.video && video.src);
-  $("placeholder").hidden = has;
   $("tc-overlay").hidden = !has;
-  const total = totalSeconds();
+  showEntry(TL.entries[entryAt(PL.t)]);
+  const total = TL.total;
   const scrub = $("scrub");
   scrub.max = String(total || 0);
-  scrub.disabled = !has;
-  // ticks
-  $("ticks").innerHTML = lo && total ? lo.plan.map((r, i) => {
-    const pct = (r.start / total) * 100;
-    const band = r.kind === "clip"
-      ? `<div class="clip-band" style="left:${pct}%;width:${((r.end - r.start) / total) * 100}%" title="Clip"></div>` : "";
-    return band + `<div class="tick${r.kind === "clip" ? " clip" : ""}" style="left:calc(${pct}% - .5px)"><div></div></div>` +
-      `<div class="tick-label${r.kind === "clip" ? " clip" : ""}" style="left:calc(${pct}% + 4px)">${r.kind === "clip" ? "▶" : "S"}${rowNum(lo, i)}</div>`;
+  scrub.disabled = !TL.entries.length || !has;
+  $("ticks").innerHTML = "";
+  // the timeline: one block per Shot, its thumbnail, ◀ take ▶ under it
+  const off = !!S.busy;
+  $("tl-strip").innerHTML = total ? TL.entries.map((e) => {
+    const sh = shotById(e.id);
+    if (!sh) return "";
+    const st = sh.kind === "clip" ? "clip" : sh.status;
+    const list = sh.kind !== "clip" && sh.take ? S.takes[sh.id] : null;
+    const i = list ? list.findIndex((t) => t.name === sh.take) : -1;
+    const nav = list && list.length > 1 ? `<div class="tl-takes">
+        <button class="tl-arrow" data-action="tl-take" data-dir="-1"${i <= 0 || off ? " disabled" : ""} aria-label="Previous take of ${esc(titleOf(sh))}">◀</button>
+        <span>${i + 1}/${list.length}</span>
+        <button class="tl-arrow" data-action="tl-take" data-dir="1"${i < 0 || i >= list.length - 1 || off ? " disabled" : ""} aria-label="Next take of ${esc(titleOf(sh))}">▶</button></div>` : "";
+    const why = !e.rendered ? "not rendered yet" : e.noclip ? "its clip is being made" : st;
+    return `<div class="tl-block st-${st}${S.focus === e.id ? " focus" : ""}${e.src ? "" : " gap"}" data-tl="${esc(e.id)}"
+        style="left:${(e.start / total) * 100}%;width:${(e.dur / total) * 100}%">
+      <button class="tl-pick" data-action="tl-pick" title="${esc(titleOf(sh))} · ${esc(why)} · click to go there"
+        ${e.thumb ? `style="background-image:url('${esc(e.thumb)}')"` : ""}><span class="tl-num">${sh.kind === "clip" ? "▶" : "S"}${numOf(sh.id)}</span></button>
+      ${nav}</div>`;
   }).join("") : "";
+  const approx = !TL.exact && TL.entries.some((e) => e.rendered);
+  $("tl-approx").hidden = !approx;
+  $("tl-update").disabled = off || S.conn !== "ok";
+  const older = takesWithoutClips().length;
+  $("tl-make").hidden = !older;
+  $("tl-make").textContent = `Make clips for ${older} older take${older === 1 ? "" : "s"}`;
+  $("tl-make").disabled = off || S.conn !== "ok";
   // loop band + note
   const L = loopRange();
   const band = $("loop-band"), note = $("loop-note");
@@ -1680,21 +2250,20 @@ function renderViewer() {
     band.hidden = false;
     band.style.left = (L.a / total) * 100 + "%";
     band.style.width = ((L.b - L.a) / total) * 100 + "%";
-    const rv = reviewShot();
     note.hidden = false;
     note.textContent = `Looping ${fmt(L.a)} → ${fmt(L.b)}` + (L.prev
-      ? ` · last half of ${L.prevTitle}, the seam, then ${titleOf(rv)}` : ` · ${titleOf(rv)}`);
+      ? ` · last half of ${L.prevTitle}, the seam, then ${titleOf(L.shot)}` : ` · ${titleOf(L.shot)}`);
   } else {
     band.hidden = true;
     note.hidden = true;
   }
-  const rv = reviewShot();
-  $("jump").textContent = "Jump to " + titleOf(rv);
-  $("jump").disabled = !has || !rv || !L;
+  $("jump").textContent = "Jump to " + (L ? titleOf(L.shot) : titleOf(reviewShot()));
+  $("jump").disabled = !has || !L;
   $("loop").setAttribute("aria-pressed", S.loop && !!L);
   $("loop").disabled = !has || !L;
-  for (const el of document.querySelectorAll('[data-which="output"], #download')) el.toggleAttribute("disabled", !has);
-  $("download").hidden = S.local || !has;
+  const hasFile = !!(lo && lo.video);
+  for (const el of document.querySelectorAll('[data-which="output"], #download')) el.toggleAttribute("disabled", !hasFile);
+  $("download").hidden = S.local || !hasFile;
   updateTime();
 }
 
@@ -1747,15 +2316,17 @@ function renderDecision() {
         : "All shots approved. Install ComfyUI-NVIDIA-RTX-VSR-Pro to upscale the final video.";
   }
   const v = P().settings.rtx_vsr;
-  const stale = !nx && previewStale();
+  // the timeline shows every take; the exact stitched video is Update preview's
+  // (under the timeline) or the final's job, so it never blocks the next step
+  const stale = !nx && previewStale() && !vsrOk;
   if (stale && !rv) line = "The timeline changed since the last preview. Update it: every Shot loads its take, nothing is sampled.";
   // [ ✓ Approve 25% ][ main action 50% ][ ⟳ Reroll 25% ]
   let mainLabel, mainAction, mainOff = false;
   const reviews = active().filter((s) => s.status === "review");
   if (rv && reviews.length > 1) {
     // several Shots rendered at once (Render all / Render odd Shots): review them one by one
-    if (!missing.length) line = `${reviews.length} Shots to review. Happy with ${titleOf(rv)}? Approve it and go on to ${titleOf(reviews[1])}.`;
-    mainLabel = `✓ Approve & review ${titleOf(reviews[1])}`;
+    if (!missing.length) line = `${reviews.length} Shots to review. Happy with ${titleOf(rv)}? Approve it and go on to ${titleOf(reviews.find((x) => x !== rv))}.`;
+    mainLabel = `✓ Approve & review ${titleOf(reviews.find((x) => x !== rv))}`;
     mainAction = "approve-next";
   } else if (rv && nx) { mainLabel = `✓ Approve & render ${titleOf(nx)}`; mainAction = "primary"; }
   else if (rv && stale) { mainLabel = "✓ Approve & update preview"; mainAction = "primary"; }
@@ -1839,7 +2410,7 @@ function startPreview() {
   preview.start = Math.max(0, Number(a.start) || 0);
   const len = Math.max(0, Number(a.length) || 0);
   preview.end = len ? preview.start + len : Infinity;
-  video.pause();
+  if (PL.playing) pausePlayer();
   el.volume = video.volume;
   preview.on = true;
   renderAudio();
@@ -1863,7 +2434,7 @@ function startPreview() {
   }
 }
 
-video.addEventListener("play", stopPreview);
+
 video.addEventListener("volumechange", () => { preview.el.volume = video.volume; });
 
 function renderAudio() {
@@ -1910,10 +2481,14 @@ const even = (x) => 2 * Math.round(x / 2);
 
 /** ComfyUI holds every frame in RAM as float32, before and after the upscale. */
 function vsrRamNote(size, scale) {
-  const secs = active().reduce((a, s) => a + ((lastRowFor(s.id) || {}).seconds || Number(s.seconds) || 0), 0);
-  const frames = Math.round(secs * FPS);
-  const gb = (frames * size[0] * size[1] * 3 * 4 * (1 + scale * scale)) / 1024 ** 3;
-  return `Needs about ${gb < 10 ? gb.toFixed(1) : Math.round(gb)} GB of system RAM for the full ${secs.toFixed(0)} s at ${scale}×.`;
+  const secs = filmSeconds(), frames = Math.round(secs * FPS);
+  const per = size[0] * size[1] * 3 * 4 / 1024 ** 3;                    // GB per decoded frame (float32)
+  // One decoded copy of the film (ComfyUI keeps it between chunks); the upscale
+  // then works a frame at a time next to it (Long Shot 1.6.5).
+  const gb = per * frames + 1;
+  const f = (x) => x < 10 ? x.toFixed(1) : Math.round(x);
+  return `Needs about ${f(gb)} GB of system RAM (the decoded ${secs.toFixed(0)} s film); ` +
+    `the ${scale}× upscale adds little, a frame at a time.`;
 }
 
 function browseBtn(kind, target, disabled) {
@@ -1961,6 +2536,8 @@ function renderSettings() {
       <label class="lbl">Seed · fixed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
       <button class="ghost sm reset-seeds" data-action="reset-seeds"${P().shots.some((x) => x.kind !== "clip" && Number(x.shot_seed) >= 0) ? "" : " disabled"}
         title="Put the Shots' own seeds back to auto, so they follow this seed again">Reset Shot seeds</button>
+      <label class="lbl multi-take" title="Each render runs this many times, each with a new seed, like ComfyUI's batch count. The Shot shows take 1 afterwards; flip through the rest with ◀ ▶ on the timeline.">Multi-take
+        <input type="number" min="1" max="${MULTI_MAX}" step="1" data-multi value="${esc(multiTakes())}"></label>
       <span class="muted small" id="seed-help">Feeds every Shot left on auto. Type a seed to go back to it; use Reroll for new takes.</span>
     </div>
     <div class="grid3">
@@ -1981,6 +2558,7 @@ function renderSettings() {
         `<option value="${x}"${Number(vsr.scale) === x ? " selected" : ""}>${x}×</option>`).join("")}</select></label>
       <label class="lbl-row">Quality <select data-vsr="quality"${vsrOk ? "" : " disabled"}>${["LOW", "MEDIUM", "HIGH", "ULTRA"].map((q) =>
         `<option${vsr.quality === q ? " selected" : ""}>${q}</option>`).join("")}</select></label>
+      <label class="lbl-row" title="The upscale is saved in pieces of this many seconds, counted in the status line, then joined. RAM use doesn't depend on it.">Chunks <input type="number" min="2" max="600" step="1" data-vsr="chunk_s" value="${esc(vsrChunkS())}"${vsrOk ? "" : " disabled"} style="width:64px"> s</label>
     </div>
     <label class="check-row prores-row${vsrOk ? "" : " off"}"><input type="checkbox" data-outfile="prores_master"${s.prores_master ? " checked" : ""}${vsrOk ? "" : " disabled"}>
       <span>Final video: also save a ProRes master <span class="muted small">· 10-bit ProRes 422 HQ .mov with sound, next to the upscaled MP4 (large files)</span></span></label>
@@ -2139,17 +2717,22 @@ document.addEventListener("click", async (e) => {
       if (!rv || busyGuard()) break;
       rv.status = "approved"; rv.was_approved = false;
       const nextRv = reviewShot();
-      if (nextRv) {
-        S.open = nextRv.id;
-        const row = lastRowFor(nextRv.id);
-        if (row && video.src) { video.pause(); video.currentTime = row.start + 0.04; updateTime(); }
-      }
+      const wasPlaying = PL.playing;
       commit();
+      if (nextRv) {
+        // jump the player to the start of the next Shot (after any redraw this click deferred)
+        const go = () => {
+          focusShot(nextRv.id);
+          if (wasPlaying) play();
+        };
+        go();
+        setTimeout(() => { if (S.focus === nextRv.id && !PL.playing) focusShot(nextRv.id); }, 0);
+      }
       break;
     }
-    case "approve-final": { const rv = reviewShot(); if (rv) { rv.status = "approved"; rv.was_approved = false; } if (previewStale()) refreshPreview(); else upscaleFinal(); break; }
+    case "approve-final": { const rv = reviewShot(); if (rv) { rv.status = "approved"; rv.was_approved = false; } upscaleFinal(); break; }
     case "bridge": bridgeShot(shotOf(el)); break;
-    case "render-alone": renderAlone(shotOf(el)); break;
+    case "render-alone": renderAloneAction(shotOf(el)); break;
     case "clear-render": clearRender(shotOf(el)); break;
     case "render-all": renderAll(); break;
     case "render-odd": renderOdd(); break;
@@ -2306,14 +2889,19 @@ document.addEventListener("click", async (e) => {
     }
     case "play": togglePlay(); break;
     case "step": stepFrame(+el.dataset.dir); break;
-    case "jump": { const L = loopRange(); if (L) { video.pause(); video.currentTime = p.last_output.plan[L.i].start; updateTime(); } break; }
+    case "jump": { const L = loopRange(); if (L) { if (PL.playing) pausePlayer(); tlSeek(TL.entries[L.i].start + 0.04); } break; }
     case "loop": {
       const L = loopRange();
       S.loop = !S.loop && !!L;
-      if (S.loop) { video.currentTime = L.a; play(); }
+      if (S.loop) { tlSeek(L.a); play(); }
       renderViewer();
       break;
     }
+    case "tl-pick": { const b = el.closest("[data-tl]"); if (b) focusShot(b.dataset.tl); break; }
+    case "tl-take": { const b = el.closest("[data-tl]"); const sh = b && shotById(b.dataset.tl); if (sh) { S.focus = sh.id; stepTake(sh, +el.dataset.dir); } break; }
+    case "update-preview": updatePreview(); break;
+    case "make-clips": makeClips(takesWithoutClips()); break;
+    case "clear-all": clearAll(); break;
     case "open-folder": openFolder(el.dataset.which); break;
     case "menu": toggleMenu(); break;
     case "new-project": closeMenu(); newProject(); break;
@@ -2338,7 +2926,7 @@ document.addEventListener("click", async (e) => {
 });
 
 function busyGuard() {
-  if (!S.busy) return false;
+  if (!S.busy && !S.chunking) return false;
   toast("Wait for the render to finish (or Stop it) first.");
   return true;
 }
@@ -2379,13 +2967,21 @@ document.addEventListener("change", async (e) => {
   committed.set(el, el.value);
   if (el.dataset.relink) { relinkFromSelect(el); return; }
   if (el.dataset.baseSeed !== undefined) { changeBaseSeed(el); return; }
+  if (el.dataset.multi !== undefined) {   // takes per render: nothing re-renders
+    p.settings.multi_take = Math.max(1, Math.min(MULTI_MAX, Math.round(Number(el.value)) || 1));
+    el.value = String(p.settings.multi_take);
+    return commit();
+  }
   if (el.dataset.outfile) {        // which files a render keeps: nothing re-renders
     p.settings[el.dataset.outfile] = el.checked;
     return commit();
   }
   if (el.dataset.vsr) {            // post-process only: no Shot re-renders
     const k = el.dataset.vsr;
-    p.settings.rtx_vsr[k] = k === "scale" ? Number(el.value) : el.value;
+    if (k === "chunk_s") {
+      p.settings.rtx_vsr.chunk_s = Math.max(2, Math.min(600, Math.round(Number(el.value)) || 10));
+      el.value = String(p.settings.rtx_vsr.chunk_s);
+    } else p.settings.rtx_vsr[k] = k === "scale" ? Number(el.value) : el.value;
     return commit();
   }
   if (S.busy && !el.dataset.shotField) {
@@ -2593,7 +3189,9 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$("modal").hidden) { $("modal").hidden = true; return; }
   if (e.key === "Escape" && S.theater && !document.fullscreenElement) { setTheater(false); return; }
   const t = e.target;
-  if (t.closest && t.closest("input, textarea, select, [contenteditable]")) return;
+  // the timeline scrubber is the player itself: Space and ← → act on it there too
+  const onScrub = t.id === "scrub";
+  if (!onScrub && t.closest && t.closest("input, textarea, select, [contenteditable]")) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.key === "m" || e.key === "M") { e.preventDefault(); toggleMute(); }
   else if (e.key === "f" || e.key === "F") { e.preventDefault(); toggleFullscreen(); }
@@ -2687,7 +3285,8 @@ async function openList() {
     return `<button class="proj-row${p.slug === P().slug ? " current" : ""}" data-action="open-project" data-slug="${esc(p.slug)}">
       <span class="proj-thumb">${thumb}</span>
       <span class="proj-meta"><b>${esc(p.name)}</b>
-        <span class="muted small">Saved ${esc(when(p.saved_at))} · ${p.approved} of ${p.shots} shots approved</span></span></button>`;
+        <span class="muted small">Saved ${esc(when(p.saved_at))} · ${p.approved} of ${p.shots} shots approved</span>
+        ${p.files_missing ? '<span class="missing-tag" title="Its input or output folder was deleted. Delete the project, or put the folder back.">files missing</span>' : ""}</span></button>`;
   }).join("") || '<div class="muted">No saved projects yet.</div>';
   showModal("Open project", null, rows);
 }
@@ -2698,6 +3297,7 @@ function deleteDialog() {
     <div class="checks">
       <label${local ? "" : " hidden"}><input type="checkbox" id="del-segments"> Also delete its saved takes (output/longshot/${esc(P().slug)}/takes)</label>
       <label${local ? "" : " hidden"}><input type="checkbox" id="del-inputs"> Also delete its input folder (input/longshot/${esc(P().slug)})</label>
+      <label${local ? "" : " hidden"}><input type="checkbox" id="del-videos"> Also delete its videos (output/longshot/${esc(P().slug)}/videos and its timeline clips)</label>
       ${local ? "" : '<span class="muted small">Files can only be deleted from the machine running ComfyUI.</span>'}
     </div>
     <div class="dialog-actions"><button class="ghost" data-action="close-modal">Keep it</button>
@@ -2773,6 +3373,7 @@ async function confirmDelete() {
   const q = [];
   if ($("del-segments") && $("del-segments").checked) q.push("segments=1");
   if ($("del-inputs") && $("del-inputs").checked) q.push("inputs=1");
+  if ($("del-videos") && $("del-videos").checked) q.push("videos=1");
   const slug = P().slug;
   clearTimeout(saveTimer);
   try {
@@ -3873,6 +4474,7 @@ async function fetchTakes(id) {
   takesLoading.delete(id);
   renderShots();
   renderDecision();
+  renderViewer();
 }
 
 /** "Take 2 of 4 ◀ ▶" for a rendered Shot with more than one take. */
@@ -3911,8 +4513,8 @@ function useTake(s, name) {
   Object.keys(S.bad).forEach((k) => { if (k.startsWith(s.id + ":")) delete S.bad[k]; });
   if (s.status === "queued") s.status = "review";
   S.dry = null;
-  commit();
-  refreshPreview();
+  commit();               // the timeline swaps in that take's clip; nothing is decoded
+  ensureClips();          // a take from before 0.6.5 gets its clip now
 }
 
 function manageTakes(s) {
@@ -3992,6 +4594,9 @@ async function rerollShot(s) {
     if (!mode || S.busy) return;
     alone = mode === "alone";
   }
+  const takes = await askMulti(titleOf(s));
+  if (!takes || S.busy) return;
+  const ids = [s.id];
   if (s.standalone && !alone) {
     // pinned in place to the rendered Shots around it; it stops being standalone
     rememberTake(s);
@@ -4000,8 +4605,9 @@ async function rerollShot(s) {
     s.was_approved = false;
     S.dry = null;
     render();
-    queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${numOf(s.id)} · ${pinnedNote(s)} · seed ${s.shot_seed}`,
-      note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) });
+    const pin = pinnedNote(s);
+    multiGo(takes, ids, () => queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${numOf(s.id)} · ${pin} · seed ${s.shot_seed}`,
+      note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) }));
     return;
   }
   if (s.standalone) {
@@ -4011,8 +4617,8 @@ async function rerollShot(s) {
     s.was_approved = false;
     S.dry = null;
     render();
-    queue({ upto: s.id, kind: "reroll", standalone: true, label: `Re-rolling Shot ${numOf(s.id)} on its own · seed ${s.shot_seed}`,
-      note: "A fresh start · no pins to the Shots around it", onDone: onRendered(s.id, true) });
+    multiGo(takes, ids, () => queue({ upto: s.id, kind: "reroll", standalone: true, label: `Re-rolling Shot ${numOf(s.id)} on its own · seed ${s.shot_seed}`,
+      note: "A fresh start · no pins to the Shots around it", onDone: onRendered(s.id, true) }));
     return;
   }
   const after = renderedAfter(s);
@@ -4033,9 +4639,9 @@ async function rerollShot(s) {
   S.dry = null;
   const n = numOf(s.id);
   render();
-  queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${n} · seed ${s.shot_seed}`,
+  multiGo(takes, ids, () => queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${n} · seed ${s.shot_seed}`,
     note: renderedAfter(s).length ? "In place · the Shots around it keep their takes" : "",
-    onDone: onRendered(s.id) });
+    onDone: onRendered(s.id) }));
 }
 
 function useSeed(s, seed) {
@@ -4058,10 +4664,10 @@ function finalState() {
 
 function upscaleFinal() {
   const act = active();
-  if (!act.length || S.busy) return;
+  if (!act.length || S.busy || S.chunking) return;
   const v = P().settings.rtx_vsr;
   const target = act[act.length - 1].id;
-  queue({ upto: target, kind: "final", final: true, label: `Upscaling final video · ${v.scale}× ${v.quality}`,
+  wholeQueue({ upto: target, kind: "final", final: true, label: `Upscaling final video · ${v.scale}× ${v.quality}`,
     note: "Every Shot loads its saved take; decoding, upscaling and saving",
     onDone: ({ rows, text, outputs, built }) => {
       const combine = outputs[built.nodes.combine] || {};
@@ -4074,7 +4680,7 @@ function upscaleFinal() {
       P().final_output = { video, master, chain: built.chain, scale: v.scale, quality: v.quality,
         source_at, at: new Date().toISOString() };
       P().last_output = Object.assign({}, lo || {}, { video, plan: rows, chain: built.chain, text,
-        size: [built.width, built.height], source_at });
+        size: [built.width, built.height], source_at, video_plan: rows, video_chain: built.chain });
       loadVideo(0);
       toast(`Final video saved as ${video.filename}` + (master ? ` and the ProRes master as ${master.filename}.` : "."));
     } });
@@ -4144,6 +4750,7 @@ async function init() {
   try {
     const caps = await api("/longshot/capabilities");
     S.local = !!caps.local;
+    $("brand-ver").textContent = caps.version || "";
   } catch (e) { S.local = false; }
   document.body.classList.toggle("is-local", S.local);
   try { S.opts = await api("/longshot/options"); } catch (e) { toast("Couldn't read ComfyUI's model lists: " + e.message); }
