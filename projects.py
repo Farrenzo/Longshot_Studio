@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.7.3"
+STUDIO_VERSION = "0.7.5"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -655,11 +655,95 @@ def approved_subfolder(slug):
     return f"longshot/{slug}/{APPROVED_DIR}"
 
 
+_MANIFEST = ".export.json"
+
+
+def _read_manifest(folder):
+    """What the upscaled export left in Approved_Clips: {name.mp4: {key, sig, prores}}."""
+    try:
+        with open(os.path.join(folder, _MANIFEST), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_manifest(folder, data):
+    path = os.path.join(folder, _MANIFEST)
+    if not data:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def keep_upscaled(output_dir, slug, items, sig, prores=False):
+    """Before an upscaled export: [{key, name}] wanted at upscale `sig`. Clips
+    already upscaled from the same take at the same settings stay (renamed when
+    their number changed); everything else in the folder goes, so it matches the
+    timeline. Returns {"kept": [names], "todo": [keys still to upscale]}."""
+    if not is_slug(slug):
+        raise ValueError("Not a project slug.")
+    want = []
+    for it in items or []:
+        key = str((it or {}).get("key") or "")
+        if not _CLIP_KEY_RE.fullmatch(key):
+            raise ValueError(f"Not a clip: {key!r}")
+        want.append((key, _export_name(str(it.get("name") or ""), ".mp4")))
+    folder = approved_folder(output_dir, slug)
+    if not os.path.isdir(folder):
+        return {"kept": [], "todo": [k for k, _ in want]}
+    man = _read_manifest(folder)
+    by_key = {}
+    for fname, rec in man.items():
+        if not isinstance(rec, dict) or rec.get("sig") != sig or not _plain_file_name(fname):
+            continue
+        if not os.path.isfile(os.path.join(folder, fname)):
+            continue
+        mov = fname[:-4] + ".mov"
+        if prores and not os.path.isfile(os.path.join(folder, mov)):
+            continue
+        by_key.setdefault(rec.get("key"), fname)
+    keep, todo = [], []                       # keep: (old name, new name, key)
+    for key, name in want:
+        old = by_key.pop(key, None)
+        if old:
+            keep.append((old, name, key))
+        else:
+            todo.append(key)
+    # rename through temporary names (numbers can shift by one)
+    moves = []
+    for i, (old, new, key) in enumerate(keep):
+        for ext in (".mp4", ".mov"):
+            src = os.path.join(folder, old[:-4] + ext)
+            if os.path.isfile(src):
+                tmp = os.path.join(folder, f".keep{i}{ext}.part")   # not a video: clearing leaves it
+                os.replace(src, tmp)
+                moves.append((tmp, os.path.join(folder, new[:-4] + ext)))
+    clear_approved(output_dir, slug, keep_work=False)
+    for tmp, dest in moves:
+        os.replace(tmp, dest)
+    new_man = {}
+    for old, new, key in keep:
+        rec = dict(man.get(old) or {})
+        rec.update(key=key, sig=sig)
+        rec["prores"] = os.path.isfile(os.path.join(folder, new[:-4] + ".mov"))
+        new_man[new] = rec
+    _write_manifest(folder, new_man)
+    return {"kept": [new for _, new, _ in keep], "todo": todo}
+
+
 def clear_approved(output_dir, slug, keep_work=False):
     """Empty Approved_Clips of its videos (and the upscale's work files)."""
     folder = approved_folder(output_dir, slug)
     if not is_slug(slug) or not os.path.isdir(folder):
         return 0
+    _write_manifest(folder, {})
     n = 0
     for f in os.listdir(folder):
         path = os.path.join(folder, f)
@@ -715,11 +799,13 @@ def _work_path(output_dir, slug, entry):
     return path
 
 
-def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None):
-    """The upscaled export: [{name, video, audio, master}] (work files the
+def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None, sig=None):
+    """The upscaled export: [{name, video, audio, master, key}] (work files the
     Upscale Chunk / Save Audio nodes wrote) -> Approved_Clips/<name>.mp4 (and
-    <name>.mov with the ProRes copy), pictures copied, sound added. The folder
-    is emptied first and the work files are removed afterwards."""
+    <name>.mov with the ProRes copy), pictures copied, sound added. With `sig`
+    (incremental: keep_upscaled ran first) the clips already there stay and the
+    new ones are recorded; without it the folder is emptied first. The work
+    files are removed afterwards."""
     import subprocess
     run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, timeout=900))
     if not is_slug(slug):
@@ -734,7 +820,10 @@ def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None):
     if not plan:
         raise ValueError("No approved clips to export.")
     folder = approved_folder(output_dir, slug)
-    clear_approved(output_dir, slug, keep_work=True)
+    if sig is None:
+        clear_approved(output_dir, slug, keep_work=True)
+    man = _read_manifest(folder) if sig is not None else {}
+    keys = {str((it or {}).get("name") or ""): str((it or {}).get("key") or "") for it in items or []}
     out = []
     for name, video, wav, master in plan:
         for src, ext, acodec, extra in ((video, ".mp4", ["aac", "-b:a", "256k"], ["-movflags", "+faststart"]),
@@ -751,6 +840,10 @@ def mux_approved(output_dir, slug, items, ffmpeg="ffmpeg", run=None):
                 raise RuntimeError(f"Saving {name}{ext} failed: " +
                                    (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))[-400:])
             out.append(name + ext)
+        if sig is not None and keys.get(name):
+            man[name + ".mp4"] = {"key": keys[name], "sig": sig, "prores": bool(master)}
+    if sig is not None:
+        _write_manifest(folder, man)
     shutil.rmtree(os.path.join(folder, _WORK_DIR), ignore_errors=True)
     return out
 

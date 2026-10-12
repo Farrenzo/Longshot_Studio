@@ -1238,12 +1238,18 @@ def register(routes=None):
                 if not ffmpeg:
                     return error("ffmpeg isn't available.", 500)
                 names = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: pj.mux_approved(out_dir, slug, body.get("items"), ffmpeg=ffmpeg))
+                    None, lambda: pj.mux_approved(out_dir, slug, body.get("items"), ffmpeg=ffmpeg,
+                                                  sig=body.get("sig")))
+            elif mode == "keep":
+                res = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: pj.keep_upscaled(out_dir, slug, body.get("items"), str(body.get("sig") or ""),
+                                                   prores=bool(body.get("prores"))))
+                return web.json_response({**res, "subfolder": pj.approved_subfolder(slug)})
             elif mode == "clear":
                 names = []
                 pj.clear_approved(out_dir, slug)
             else:
-                return error("mode must be copy, mux or clear.")
+                return error("mode must be copy, mux, keep or clear.")
         except ValueError as err:
             return error(err)
         except Exception as err:

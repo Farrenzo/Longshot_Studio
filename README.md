@@ -1,7 +1,6 @@
 # H3 Long Shot Studio
-<img width="1719" height="1360" alt="image" src="https://github.com/user-attachments/assets/9b81e6e1-a090-4c9b-8d51-8332f3c6c822" />
 
-## What's new in 0.7.3
+## What's new in 0.7.5
 
 Needs H3 Long Shot **1.6.7 or later** (its Take node, up to 64 Shots, the Upscale Chunk and Save Audio
 nodes the chunked upscale uses, and frame anchors). Replace both
@@ -45,6 +44,41 @@ title in the top bar.
   frames instead (which already end on the image), so the join stays smooth.
 - Changing an anchor asks to re-render the two Shots touching it, or keep their takes.
 - No anchor next to a Clip Shot (the clip's own frames anchor that join).
+
+**Keep setting up while it renders**
+- While a render runs you can change references (add, drop, edit, bypass, remove, swap
+  pictures), settings, audio, LoRAs and models, frame anchors, the base seed and Reset Shot
+  seeds, start or import other projects, Update preview and Export. The render going now
+  keeps what it started with; jobs that start later use the new setup. When it lands, the
+  notice says which Shots rendered with the earlier setup and offers **Re-render them**.
+- Still waiting for the render: Clear all renders, Clear cache / Free memory, renaming or
+  deleting the project, and the Shots that are part of the render itself.
+- The only question is for **resolution and aspect ratio** (old takes can't be used at
+  another size). Changed during a render, that render finishes at the old size and its
+  Shots then render again too.
+- **▶ on a Shot that's rendering or waiting in the queue** is now yellow and clickable: it
+  queues another take of that Shot after it, with the next unused seed (Multi-take works
+  here too).
+
+**Upscaled export only upscales what's new**
+- With **Upscale with RTX** on, Export keeps the clips already upscaled in Approved_Clips
+  from the same take at the same scale and quality (and with the ProRes copy, when that's
+  on): only newly approved takes are decoded and upscaled. A kept clip whose Shot number
+  moved is just renamed. Exporting with nothing new says so and does nothing.
+- Clips of Shots that are no longer approved, or whose take changed, leave Approved_Clips,
+  so it only holds the current approved Shots. The clips folder keeps every take's clip.
+- Clips upscaled by an earlier version aren't recognised, so the first upscaled export
+  after updating does them all once more.
+
+**No more question after reference or settings changes**
+- Changing a reference, a setting or a frame anchor no longer opens a dialog. Approved Shots
+  (and, for an anchor, the Shots touching it) keep their takes; Shots under review render
+  again. A notice right of the status bar says what changed and offers **Re-render
+  everything** (or, for an anchor, **Re-render Shot 1 and Shot 2**). It takes no focus,
+  lists changes made close together in one line, and stays until you close it.
+- Removing a reference still asks "Remove …?" (that's about deleting it, not re-rendering).
+  Resolution, aspect and overlap still re-render everything (old takes can't be used at
+  another size); the notice says so.
 
 **Plan and Queue fold to one line**
 - Click **▸ Plan** or **▸ Queue** to fold the panel down to one line; click again to open it.
@@ -152,13 +186,14 @@ title in the top bar.
   nothing re-renders.
 - **One click on Render always works**, also straight from a Shot's text box.
 - **Reset Shot seeds** (next to the seed in Settings) puts the Shots' own seeds back to
-  auto. With approved Shots it asks: all Shots, or only Shots not yet rendered.
+  auto. Approved Shots keep their seeds and takes; the notice offers **Reset approved Shots too**.
 
 **Keeping approved Shots**
-- **Reference changes** (add, swap, edit, bypass, remove) ask **Keep approved Shots**
-  (default) or **Re-render everything**. Kept Shots keep their takes; the change applies
-  from the next Shot you render.
-- **Settings changes** ask the same: steps, sampler, scheduler, shifts, seed mode, Turbo,
+- **Reference changes** (add, swap, edit, bypass, remove) keep approved Shots: they keep
+  their takes and the change applies from the next Shot you render. Nothing asks; a notice
+  right of the status bar says what changed, with **Re-render everything** if you want that
+  instead (× closes it).
+- **Settings changes** work the same: steps, sampler, scheduler, shifts, seed mode, Turbo,
   LoRAs, model, text encoder, VAEs, reference image size and resize, Sage attention and
   Style & Sound. Kept Shots keep the look of the old settings, so a big change (Turbo on /
   off, another LoRA) can show between Shots; a different video VAE changes how every Shot
@@ -182,9 +217,10 @@ title in the top bar.
   into `output/longshot/<project>/Approved_Clips/` as `Shot 03 – seed 1724.mp4`, numbered as
   on the timeline. Nothing is decoded: it's a copy, in seconds. The folder is emptied first,
   so it always matches the timeline. Shots not approved yet are left out (the message says
-  how many). **Upscale with RTX** instead decodes each approved take again on its own and
+  how many). **Upscale with RTX** instead decodes each newly approved take on its own and
   upscales it (scale and quality from Settings; with ProRes master on, also a `.mov` of
-  each), a frame at a time like the final. **Open folder** in the message opens it.
+  each), a frame at a time like the final; clips already upscaled from the same take and
+  settings are kept. **Open folder** in the message opens it.
 - **Upscale in chunks:** Upscale final video (and Update preview with Upscale previews on)
   decodes the film once, then upscales it a frame at a time (the upscaler is set up once per
   piece), straight into the encoder, so RAM holds the decoded film and little else; the upscaled frames never pile up, however
