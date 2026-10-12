@@ -653,19 +653,49 @@ function refChangedQuietly(what) {
 
 /** Round 2: Shots under review or approved load their take (locked); a Shot
  *  re-rendered without changing its length keeps its exact window. */
+/** Seed mode "increment" (the default) works like ComfyUI's "control after
+ *  generate": the seed in Settings is the next seed, and every Shot that renders
+ *  takes it and moves it up by one. "same" (Fixed) leaves it where it is. */
+const seedIncrements = (p = P()) => (p.settings.seed_mode || "increment") !== "same";
+
+/** The next seed off the counter (moving it up), skipping the ones this Shot already used. */
+function takeCounterSeed(s) {
+  const st = P().settings;
+  const used = new Set(s ? [...(s.prev_seeds || []), s.shot_seed].map(Number) : []);
+  let seed = (Number(st.seed) || 0) % (SEED_MAX + 1);
+  while (used.has(seed)) seed = (seed + 1) % (SEED_MAX + 1);
+  st.seed = (seed + 1) % (SEED_MAX + 1);
+  return seed;
+}
+
+/** A new seed for a reroll / bridge / another take: the counter in Increment
+ *  mode, a random one in Fixed mode (the fixed seed would give the same take). */
+function freshSeed(s) {
+  return seedIncrements() ? takeCounterSeed(s) : Math.floor(Math.random() * (SEED_MAX + 1));
+}
+
+/** When a render starts: the Shots on auto it samples take their seeds now
+ *  (Increment: off the counter, which moves up; Fixed: the seed). Returns an
+ *  undo for a render that couldn't start. */
+function claimAutoSeeds(ids) {
+  const p = P(), before = p.settings.seed, set = [];
+  for (const id of ids) {
+    const s = p.shots.find((x) => x.id === id);
+    if (!s || s.bypassed || s.kind === "clip" || Number(s.shot_seed) >= 0) continue;
+    s.shot_seed = seedIncrements(p) ? takeCounterSeed(null) : (Number(p.settings.seed) || 0);
+    set.push(s);
+  }
+  return () => { p.settings.seed = before; for (const s of set) s.shot_seed = -1; };
+}
+
 function sendable(project) {
   const p = JSON.parse(JSON.stringify(project));
-  // Auto seeds follow base + position - 1, but never repeat a seed another Shot
-  // already froze (a Shot added before Shot 1 would otherwise get Shot 1's).
-  const used = new Set(p.shots.filter((s) => Number(s.shot_seed) >= 0).map((s) => Number(s.shot_seed)));
+  // Shots still on auto (not rendering in this run): what they'd get next, in order
   const base = Number(p.settings.seed) || 0;
-  p.shots.filter((s) => !s.bypassed).forEach((s, i) => {
+  let k = 0;
+  p.shots.filter((s) => !s.bypassed).forEach((s) => {
     if (s.kind === "clip" || Number(s.shot_seed) >= 0) return;
-    if (p.settings.seed_mode === "same") { s.shot_seed = base; return; }
-    let seed = (base + i) % (SEED_MAX + 1);
-    while (used.has(seed)) seed = (seed + 1) % (SEED_MAX + 1);
-    used.add(seed);
-    s.shot_seed = seed;
+    s.shot_seed = p.settings.seed_mode === "same" ? base : (base + k++) % (SEED_MAX + 1);
   });
   for (const s of p.shots) {
     if (s.kind === "clip") { s.lock = null; s.frames = null; continue; }
@@ -1121,8 +1151,12 @@ function prepareAgain(job) {
   if (!s || s.bypassed || s.kind === "clip" || s.status === "queued" || !s.take) return;
   const used = new Set([...(s.prev_seeds || []), s.shot_seed].map(Number));
   rememberTake(s);
-  let seed = Number(s.shot_seed) >= 0 ? Number(s.shot_seed) : Math.floor(Math.random() * (SEED_MAX + 1));
-  do seed = (seed + 1) % (SEED_MAX + 1); while (used.has(seed));
+  let seed;
+  if (seedIncrements()) seed = takeCounterSeed(s);
+  else {
+    seed = Number(s.shot_seed) >= 0 ? Number(s.shot_seed) : Math.floor(Math.random() * (SEED_MAX + 1));
+    do seed = (seed + 1) % (SEED_MAX + 1); while (used.has(seed));
+  }
   s.shot_seed = seed;
   s.status = "queued";
   s.was_approved = s.was_rendered = false;
@@ -1133,6 +1167,7 @@ function prepareAgain(job) {
 /** Multi-take: take k of a Shot uses take 1's seed + (k − 1), so no two takes
  *  repeat. Without take 1's seed (it failed), the seed after the last take. */
 function passSeed(job, s) {
+  if (seedIncrements()) return takeCounterSeed(s);      // the counter: never a repeat
   const g = job.group && Q.groups[job.group];
   const base = g && g.base ? Number(g.base[s.id]) : NaN;
   const prev = Number(s.shot_seed);
@@ -1290,9 +1325,17 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     return;
   }
-  let project = sendable(P());          // seeds are settled on the whole timeline first
   const target = upto;
   if (!standalone && !omit && (kind === "render" || kind === "reroll" || kind === "refresh")) upto = chainEnd(upto);
+  // Shots on auto that this run samples take their seeds now (the counter moves up)
+  let undoSeeds = () => {};
+  if (!dry && (kind === "render" || kind === "reroll" || kind === "final" || kind === "refresh")) {
+    const act = active();
+    const end = upto ? act.findIndex((x) => x.id === upto) : act.length - 1;
+    const ids = standalone ? [target] : act.slice(0, end + 1).filter((x) => x.status === "queued").map((x) => x.id);
+    undoSeeds = claimAutoSeeds(ids.filter((id) => !(omit || []).includes(id)));
+  }
+  let project = sendable(P());          // seeds are settled on the whole timeline first
   // Shots left out of this render (sent bypassed; the project itself is untouched):
   // omit = given ids (the stitched preview leaves out Shots not rendered yet);
   // trimLeft = everything up to the last Shot before the target that isn't
@@ -1320,6 +1363,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
       : { project, upto, dry_run: !!dry, final, standalone, clips_for: clipsFor, chunk };
     built = await api("/longshot/build", { method: "POST", body });
   } catch (e) {
+    undoSeeds();
     S.error = e.message;
     render();
     return;
@@ -1331,6 +1375,7 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   try {
     res = await api("/prompt", { method: "POST", body: { prompt: built.prompt, client_id: CLIENT_ID } });
   } catch (e) {
+    undoSeeds();
     S.error = describeQueueError(e);
     render();
     return;
@@ -1683,7 +1728,7 @@ async function reroll() {
   const takes = await askMulti(titleOf(rv));
   if (!takes || reviewShot() !== rv || inRenderGuard(rv)) return;
   rememberTake(rv);
-  rv.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+  rv.shot_seed = freshSeed(rv);
   rv.status = "queued";
   enqueue({ type: "shot", target: rv.id, kind: "reroll", mode: alone ? "alone" : "pinned" }, takes);
 }
@@ -3204,13 +3249,14 @@ function renderSettings() {
   $("settings").innerHTML = `
     <div class="seed-row">
       <label class="lbl">Seed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
-      <label class="lbl seed-mode" title="Increment: Shot 1 gets the seed, Shot 2 the seed + 1, and so on. Fixed: every Shot on auto gets the same seed.">Seed mode
+      <label class="lbl seed-mode" title="Increment: the seed goes up by one for every Shot rendered, like ComfyUI's control after generate. Fixed: it stays.">Seed mode
         <select data-set="seed_mode" aria-label="Seed mode"><option value="increment"${s.seed_mode !== "same" ? " selected" : ""}>Increment</option><option value="same"${s.seed_mode === "same" ? " selected" : ""}>Fixed</option></select></label>
       <button class="ghost sm reset-seeds" data-action="reset-seeds"${P().shots.some((x) => x.kind !== "clip" && Number(x.shot_seed) >= 0) ? "" : " disabled"}
         title="Put the Shots' own seeds back to auto, so they follow this seed again">Reset Shot seeds</button>
       <label class="lbl multi-take" title="Each render runs this many times, each with a new seed, like ComfyUI's batch count. The Shot shows take 1 afterwards; flip through the rest with ◀ ▶ on the timeline.">Multi-take
         <input type="number" min="1" max="${MULTI_MAX}" step="1" data-multi value="${esc(multiTakes())}"></label>
-      <span class="muted small" id="seed-help">Feeds every Shot left on auto: ${s.seed_mode === "same" ? "each one gets this seed" : "Shot 1 gets this seed, the next + 1, and so on"}. Type a seed to go back to it; use Reroll for new takes.</span>
+      <span class="muted small" id="seed-help">${s.seed_mode === "same" ? "Fixed: every Shot on auto renders with this seed. Reroll and Multi-take still pick new ones."
+  : "Increment: the next seed. Each Shot that renders (Render, Reroll, Multi-take…) takes it and it goes up by one."}</span>
     </div>
     <div class="grid3">
       <label class="lbl">Steps <input type="number" min="1" max="200" data-set="steps" data-num value="${esc(s.steps)}"></label>
@@ -3786,6 +3832,11 @@ document.addEventListener("change", async (e) => {
   if (el.dataset.set) {
     const k = el.dataset.set;
     const v = el.dataset.num !== undefined ? Number(el.value) : el.value;
+    if (k === "seed_mode") {         // only decides the next seeds: nothing rendered changes
+      p.settings.seed_mode = v;
+      S.dry = null;
+      return commit();
+    }
     if (changed && KEEPABLE[k]) {
       // approved takes don't depend on it: they can be kept (item 2, round 5)
       const mode = await askSettingChange(`Change ${KEEPABLE[k]}`);
@@ -4546,22 +4597,9 @@ async function changeBaseSeed(el) {
   }
   if (n === Number(s.seed)) return;
   if (setupGuard()) { el.value = s.seed; return; }
-  // Only Shots on auto use the base seed; the first one and everything after it re-render.
-  const act = active();
-  const firstAuto = act.findIndex((x) => !(Number(x.shot_seed) >= 0));
-  const affected = firstAuto < 0 ? [] : act.slice(firstAuto).filter((x) => x.status !== "queued" && !inRender(x));
-  if (affected.length) changeNote("The seed", `${affected.map(titleOf).join(", ")} render${affected.length > 1 ? "" : "s"} again`);
+  // The next seed a Shot on auto takes: nothing rendered changes
   s.seed = n;
-  if (firstAuto >= 0) {
-    S.gen++;
-    for (const x of act.slice(firstAuto)) {
-      if (inRender(x)) continue;                 // rendering now: its seed is already set
-      if (x.status === "approved") x.was_approved = true;
-      else if (x.status === "review") x.was_rendered = true;
-      x.status = "queued";
-    }
-    S.dry = null;
-  }
+  S.dry = null;
   commit();
 }
 
@@ -5370,7 +5408,7 @@ function bridgeShot(s) {
   if (!s || inRenderGuard(s)) return;
   if (jobFor(s.id)) { toast(`${titleOf(s)} is already in the queue.`); return; }
   rememberTake(s);
-  s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+  s.shot_seed = freshSeed(s);
   s.status = "queued";
   s.was_approved = false;
   S.dry = null;
@@ -5402,7 +5440,7 @@ async function rerollShot(s) {
     }
   }
   rememberTake(s);
-  s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+  s.shot_seed = freshSeed(s);
   s.status = "queued";
   s.was_approved = false;
   S.dry = null;

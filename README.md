@@ -1,7 +1,6 @@
 # H3 Long Shot Studio
-<img width="1716" height="1345" alt="image" src="https://github.com/user-attachments/assets/d4540ca1-8bd4-4add-bdbc-242df0eff4a0" />
 
-## What's new in 0.7.6
+## What's new in 0.7.7
 
 Needs H3 Long Shot **1.6.7 or later**. Replace both folders, restart ComfyUI, then
 hard-refresh the Studio tab (the version shows next to the title).
@@ -11,8 +10,8 @@ hard-refresh the Studio tab (the version shows next to the title).
 2. Queue is kept in the browser: reload the tab and it carries on.
 3. Keep working while it renders: add Shots, references, settings, anchors, other projects.
 4. Yellow ▶ on a rendering or queued Shot queues another take of it.
-5. Multi-take (1–8 takes per render), seeds counting up so no take repeats.
-6. Seed mode next to the seed: Increment (+1 per Shot) or Fixed (same for every Shot).
+5. Multi-take (1–8 takes per render), each take with a new seed.
+6. Seed mode, like ComfyUI: Increment moves the Settings seed up by one per Shot rendered; Fixed keeps it.
 7. Render all, Render odd Shots, ▶ for a standalone Shot, gaps render as bridges.
 8. Up to 64 Shots per project.
 9. Clear all renders / Clear render: back to "not rendered", takes kept in history.
@@ -285,9 +284,10 @@ their take instead of sampling.
 
 ### Reviewing and rerolling
 
-- **Seed · fixed** (Settings) feeds every Shot left on auto. A Shot's seed is frozen
-  the first time it renders, so adding or moving Shots never changes it; changing the
-  base seed only affects Shots that haven't rendered yet.
+- **Seed** (Settings) is the next seed. With **Increment**, each Shot that renders takes it
+  and it goes up by one (renders, rerolls, bridges, Multi-take), like ComfyUI's control
+  after generate. With **Fixed** it stays, every Shot on auto uses it, and rerolls pick
+  random seeds. A Shot keeps its seed once rendered; changing the field never re-renders.
 - **Reroll in place.** ⟳ on an approved Shot gives it a new take with the same length,
   pinned to the Shot before it and to the Shots after it, which stay exactly as they
   are. One render.
