@@ -519,8 +519,11 @@ kbd { font-family: var(--mono); font-size: 11px; color: var(--muted); }
   display: flex; align-items: center; justify-content: center; background: rgba(23, 24, 27, .78);
   color: var(--amber-lt); font-size: 15px; pointer-events: none; }
 .proj-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
-.seed-row { grid-template-columns: minmax(0, 180px) auto auto; justify-content: start; }
-.seed-row .multi-take { width: 96px; }
+.seed-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); justify-content: stretch; }
+.seed-row select { width: 100%; }
+.seed-row select { background: var(--field); border: 1px solid var(--field-line); border-radius: 6px; color: var(--text);
+  padding: 8px 10px; font-size: 13px; }
+.seed-row .multi-take { width: 96px; justify-self: start; }
 .seed-row .multi-take input { text-align: center; }
 .seed-row #seed-help { grid-column: 1 / -1; padding-bottom: 0; }
 @media (max-width: 520px) { .seed-row { grid-template-columns: 1fr; } .reset-seeds { justify-self: start; } }

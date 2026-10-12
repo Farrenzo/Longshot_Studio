@@ -1,7 +1,6 @@
 # H3 Long Shot Studio
-<img width="1719" height="1360" alt="image" src="https://github.com/user-attachments/assets/713d49b0-6fb0-4097-8bbd-4b451e07dd39" />
 
-## What's new in 0.7.5
+## What's new in 0.7.6
 
 Needs H3 Long Shot **1.6.7 or later** (its Take node, up to 64 Shots, the Upscale Chunk and Save Audio
 nodes the chunked upscale uses, and frame anchors). Replace both
@@ -45,6 +44,13 @@ title in the top bar.
   frames instead (which already end on the image), so the join stays smooth.
 - Changing an anchor asks to re-render the two Shots touching it, or keep their takes.
 - No anchor next to a Clip Shot (the clip's own frames anchor that join).
+
+**Seed mode next to the seed**
+- Settings → Seed now has **Seed mode**: **Increment** (Shot 1 gets the seed, Shot 2 the
+  seed + 1, and so on; the default) or **Fixed** (every Shot on auto gets the same seed).
+  It moved here from Advanced → Sampling. Shots that already have their own seed (rendered,
+  or typed in) keep it; Reset Shot seeds puts them back on auto. Multi-take and Reroll
+  still give each take a new seed.
 
 **Keep setting up while it renders**
 - While a render runs you can change references (add, drop, edit, bypass, remove, swap

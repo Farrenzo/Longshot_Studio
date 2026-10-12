@@ -3203,12 +3203,14 @@ function renderSettings() {
   const asp = (o.aspects || ["16:9"]).map((a) => `<option${a === s.aspect ? " selected" : ""}>${a}</option>`).join("");
   $("settings").innerHTML = `
     <div class="seed-row">
-      <label class="lbl">Seed · fixed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
+      <label class="lbl">Seed <input class="mono" data-base-seed inputmode="numeric" value="${esc(s.seed)}" aria-describedby="seed-help"></label>
+      <label class="lbl seed-mode" title="Increment: Shot 1 gets the seed, Shot 2 the seed + 1, and so on. Fixed: every Shot on auto gets the same seed.">Seed mode
+        <select data-set="seed_mode" aria-label="Seed mode"><option value="increment"${s.seed_mode !== "same" ? " selected" : ""}>Increment</option><option value="same"${s.seed_mode === "same" ? " selected" : ""}>Fixed</option></select></label>
       <button class="ghost sm reset-seeds" data-action="reset-seeds"${P().shots.some((x) => x.kind !== "clip" && Number(x.shot_seed) >= 0) ? "" : " disabled"}
         title="Put the Shots' own seeds back to auto, so they follow this seed again">Reset Shot seeds</button>
       <label class="lbl multi-take" title="Each render runs this many times, each with a new seed, like ComfyUI's batch count. The Shot shows take 1 afterwards; flip through the rest with ◀ ▶ on the timeline.">Multi-take
         <input type="number" min="1" max="${MULTI_MAX}" step="1" data-multi value="${esc(multiTakes())}"></label>
-      <span class="muted small" id="seed-help">Feeds every Shot left on auto. Type a seed to go back to it; use Reroll for new takes.</span>
+      <span class="muted small" id="seed-help">Feeds every Shot left on auto: ${s.seed_mode === "same" ? "each one gets this seed" : "Shot 1 gets this seed, the next + 1, and so on"}. Type a seed to go back to it; use Reroll for new takes.</span>
     </div>
     <div class="grid3">
       <label class="lbl">Steps <input type="number" min="1" max="200" data-set="steps" data-num value="${esc(s.steps)}"></label>
@@ -3297,7 +3299,6 @@ function renderAdvanced() {
       <label class="lbl">Sampler ${select('data-set="sampler"', o.samplers, s.sampler)}</label>
       <label class="lbl">Scheduler ${select('data-set="scheduler"', o.schedulers, s.scheduler)}</label>
       <label class="lbl">Overlap frames <select data-set="overlap" data-num>${overlaps}</select></label>
-      <label class="lbl">Seed mode <select data-set="seed_mode"><option${s.seed_mode === "increment" ? " selected" : ""}>increment</option><option${s.seed_mode === "same" ? " selected" : ""}>same</option></select></label>
       <label class="lbl">Sage attention ${select('data-set="sage_attention"', sage, s.sage_attention)}</label>
       <label class="lbl">Reference resize (px) <input data-set="ref_resize_px" data-num type="number" min="64" step="2" value="${esc(s.ref_resize_px)}"></label>
       <label class="lbl">Shift video <input data-set="shift_video" data-num type="number" step="0.5" value="${esc(s.shift_video)}"></label>
