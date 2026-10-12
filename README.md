@@ -1,323 +1,48 @@
 # H3 Long Shot Studio
-<img width="2385" height="1349" alt="image" src="https://github.com/user-attachments/assets/ee83a834-a6f4-4d25-82db-5a9cbcabd0f2" />
+<img width="1716" height="1345" alt="image" src="https://github.com/user-attachments/assets/d4540ca1-8bd4-4add-bdbc-242df0eff4a0" />
 
 ## What's new in 0.7.6
 
-Needs H3 Long Shot **1.6.7 or later** (its Take node, up to 64 Shots, the Upscale Chunk and Save Audio
-nodes the chunked upscale uses, and frame anchors). Replace both
-folders, restart ComfyUI, then hard-refresh the Studio tab. The version shows next to the
-title in the top bar.
+Needs H3 Long Shot **1.6.7 or later**. Replace both folders, restart ComfyUI, then
+hard-refresh the Studio tab (the version shows next to the title).
 
-**Render queue** (panel under Plan)
-- Every render goes into the **queue** and runs in order: ▶ on a Shot, Reroll, Render all,
-  Render odd Shots, Multi-take, Re-render through, Bridge, Update preview, Upscale final video
-  and the upscaled Export. With nothing running, it starts right away, as before.
-- **Any project, any time:** while the queue runs you can open other projects, edit them and
-  queue their Shots. Each job renders from its own project and its result (takes, clips,
-  videos, review state) goes into **that** project's files, whether it's open or not. Only
-  the project whose job is running is locked while it renders.
-- Each row: **project · Shot 05 · take 3** (Multi-take: "take 1 of 3"), with its progress
-  while it runs, then done / failed (with the error) / stopped. Click the project name to
-  open it. Waiting jobs can be moved up or down (▲ ▼) and removed; failed or stopped ones can
-  run again (↻). **Pause** finishes the running job and holds the rest; **Clear finished**
-  tidies the list. **Stop** stops the running job only; the queue goes on.
-- Multi-take and Render odd Shots appear as one row per take / Shot.
-- **Overnight:** a failed job is marked failed and the queue moves on. **Out of memory:** the
-  Studio restarts ComfyUI, waits for it and runs that job once more (segments already
-  finished are reused); a second out-of-memory marks it failed and the queue goes on. If
-  ComfyUI is closed or crashes, the queue waits ("waits for ComfyUI") and carries on when
-  it's back. The queue is kept in this browser: closing or reloading the tab and opening the
-  Studio again picks it up (a job that was running starts again; finished segments are
-  reused). The tab has to be open for the queue to run.
-
-**Frame anchors** (the Anchors column, left of the Shots)
-- An optional image at each join: before Shot 1 (its first frame), between two Shots (the
-  last frame of one and the first of the next), and after the last Shot. Each join has a tile
-  in the **Anchors** column, sitting on the line between the two cards; it follows the cards
-  as they open and close.
-- Empty tile: **+** uploads an image (or drop one on it). Set tile: shows the picture; hover
-  for **⇄** (choose a file from the input folder) and **×** (remove). Hover the tile for which
-  `<Picture N>` it is on each side. They're separate from Cast & Scenes: each anchor goes only to the
-  two Shots touching that join, as their next `<Picture N>` after the Cast pictures.
-- The Shot is pinned to start from / end on the image, and the Studio adds "The shot begins
-  from <Picture N>." / "The shot ends on <Picture N>." to the prompt it sends (your text is
-  unchanged). A Shot continuing from a rendered Shot before it starts from that Shot's real
-  frames instead (which already end on the image), so the join stays smooth.
-- Changing an anchor asks to re-render the two Shots touching it, or keep their takes.
-- No anchor next to a Clip Shot (the clip's own frames anchor that join).
-
-**Seed mode next to the seed**
-- Settings → Seed now has **Seed mode**: **Increment** (Shot 1 gets the seed, Shot 2 the
-  seed + 1, and so on; the default) or **Fixed** (every Shot on auto gets the same seed).
-  It moved here from Advanced → Sampling. Shots that already have their own seed (rendered,
-  or typed in) keep it; Reset Shot seeds puts them back on auto. Multi-take and Reroll
-  still give each take a new seed.
-
-**Keep setting up while it renders**
-- While a render runs you can change references (add, drop, edit, bypass, remove, swap
-  pictures), settings, audio, LoRAs and models, frame anchors, the base seed and Reset Shot
-  seeds, start or import other projects, Update preview and Export. The render going now
-  keeps what it started with; jobs that start later use the new setup. When it lands, the
-  notice says which Shots rendered with the earlier setup and offers **Re-render them**.
-- Still waiting for the render: Clear all renders, Clear cache / Free memory, renaming or
-  deleting the project, and the Shots that are part of the render itself.
-- The only question is for **resolution and aspect ratio** (old takes can't be used at
-  another size). Changed during a render, that render finishes at the old size and its
-  Shots then render again too.
-- **▶ on a Shot that's rendering or waiting in the queue** is now yellow and clickable: it
-  queues another take of that Shot after it, with the next unused seed (Multi-take works
-  here too).
-
-**Upscaled export only upscales what's new**
-- With **Upscale with RTX** on, Export keeps the clips already upscaled in Approved_Clips
-  from the same take at the same scale and quality (and with the ProRes copy, when that's
-  on): only newly approved takes are decoded and upscaled. A kept clip whose Shot number
-  moved is just renamed. Exporting with nothing new says so and does nothing.
-- Clips of Shots that are no longer approved, or whose take changed, leave Approved_Clips,
-  so it only holds the current approved Shots. The clips folder keeps every take's clip.
-- Clips upscaled by an earlier version aren't recognised, so the first upscaled export
-  after updating does them all once more.
-
-**No more question after reference or settings changes**
-- Changing a reference, a setting or a frame anchor no longer opens a dialog. Approved Shots
-  (and, for an anchor, the Shots touching it) keep their takes; Shots under review render
-  again. A notice right of the status bar says what changed and offers **Re-render
-  everything** (or, for an anchor, **Re-render Shot 1 and Shot 2**). It takes no focus,
-  lists changes made close together in one line, and stays until you close it.
-- Removing a reference still asks "Remove …?" (that's about deleting it, not re-rendering).
-  Resolution, aspect and overlap still re-render everything (old takes can't be used at
-  another size); the notice says so.
-
-**Plan and Queue fold to one line**
-- Click **▸ Plan** or **▸ Queue** to fold the panel down to one line; click again to open it.
-  Folded, the Plan shows the Shot rendering (or the next one to render) and the Queue shows
-  the job running (or the next one waiting). Their buttons stay visible. Remembered in this
-  browser.
-
-**Fixes**
-- With frame anchors on, "Add shot before Shot 1" lines up with the Shot cards instead of
-  running into the Anchors column.
-- While a project renders, you can keep working on it after the part that's rendering: add
-  Shots (Add Shot, ⊕ Shot after, clips), write them, bypass or remove them, and queue them
-  (▶, Render all, Render odd Shots). They render after the current job, continuing from it.
-  Only the Shots in the running render (up to the one it renders) wait. A Shot you're writing
-  stays open when the render lands. Render all / Render odd Shots count only Shots not
-  already in the queue.
-- Multi-take seeds count up: take 2 of a Shot uses take 1's seed + 1, take 3 + 2 and so on,
-  so no two takes repeat (they used to be drawn at random).
-- Edit reference: the yellow focus outline is visible on all sides of the fields again.
-- Timeline clips are never made on their own any more. Opening a project whose clips are
-  missing (deleted, or takes from before 0.6.5) used to decode every one of them straight
-  away, which looked like a batch of renders. Now the timeline offers **Make N missing
-  clips** (decode only, nothing is sampled) and you click it when you want them. A render's
-  own new takes still get their clips as part of the render, and switching to a take that
-  has no clip makes just that one.
-
-**Every take has its own clip; the film is stitched and decoded only at the end**
-- A render samples the new Shot in its place in the chain (pinned to its neighbours, as
-  before), then decodes **only that Shot's take, on its own**, into
-  `output/longshot/<project>/clips/`. The rest of the film isn't decoded, so a render's
-  decode costs one Shot however long the film is.
-- **Update preview** and **Upscale final video** take every Shot's take, stitch them in
-  latent space and decode the whole film once (exact joins). The final no longer needs
-  an Update preview first.
-- Takes without a clip (made before 0.6.5, or their clip was deleted) get one when you click
-  **Make N missing clips** under the timeline (each decoded on its own, nothing sampled).
-  **Make clips for N older takes** does the whole take history.
-
-**Timeline viewer**
-- **Full screen** shows the video centred on the whole screen. The control bar and review
-  panel hide and come back when the mouse moves to the bottom of the screen (they stay while
-  the pointer is over them, while dragging the scrubber, or when a control has the keyboard
-  focus); the cursor hides after two seconds without moving.
-- The scrub bar is now a **timeline**: one block per Shot under the video, with its number,
-  a thumbnail and **◀ take ▶** arrows. Play and scrub run across every Shot; Shots not
-  rendered yet show as dark blocks of their length.
-- **Switching takes is instant** and makes it the take the Shot uses: the timeline plays
-  that take's clip, nothing is decoded.
-- **Click a block** to jump there and pick that Shot: Approve, Reroll, Loop and Jump act on
-  it.
-- A take's clip includes the frames it shares with its neighbours; at each join the
-  timeline shows half of them from each side, so its length matches the film. Joins are
-  **approximate** until **Update preview** (or the final): takes never rendered side by
-  side can jump slightly at the cut. After Update preview the timeline plays the exact
-  video until something changes.
-
-**Rendering Shots**
-- **Multi-take** (Settings, next to Reset Shot seeds; 1–8, default 1) works like ComfyUI's
-  batch count: every render (Render Shot N, Reroll, ▶ on its own, Render all, Render odd
-  Shots) runs that many times in a row, each time with new seeds. Above 1, a box asks first:
-  **Render N takes**, **Just 1 take** or **Cancel**. Render all with Multi-take 3 makes three
-  full passes; in each pass every Shot continues from that pass's take of the Shot before.
-  Every take is kept with its own clip. When the batch ends, each Shot shows **take 1** of
-  the batch for review; flip through the others with ◀ ▶ on the timeline. **Stop** ends
-  the batch, and its Shots go back to take 1.
-- **Up to 64 Shots** in a project's chain (was 16; needs Long Shot 1.6.1).
-- **▶ Render all** (Shots panel): one run renders every Shot not rendered yet, each
-  continued from the Shot before it. Rendered Shots keep their takes, so gaps between
-  them render as bridges.
-- **▶ Render odd Shots** (Shots panel): Shots 1, 3, 5… each on its own, one after
-  another. Follow with **Render all** to bridge Shots 2, 4, 6….
-- **▶ on any Shot not rendered yet** (in place of its status circle): renders that Shot on
-  its own, fresh from the references. See *Standalone Shots and bridging*.
-- **Gaps render as bridges:** a Shot between two rendered Shots is pinned to the ending of
-  the one before and the opening of the one after.
-- **Rerolling a standalone Shot** next to rendered Shots asks **Pinned to Shot N and Shot
-  M** (default: in place, the neighbours keep their takes, and it's no longer standalone)
-  or **On its own** (a fresh start; the joins become hard cuts until bridged again).
-  Re-rendering one after an edit asks the same.
-- **Clear all renders** (Shots panel): every rendered Shot back to "not rendered", keeping
-  prompt, length and seed; optionally **give every Shot a new random seed**. Without new
-  seeds, rendering again brings the same takes back from disk in moments.
-- **Clear render** (in an open Shot): back to "not rendered", keeping prompt, length and
-  seed. It then renders again pinned to the Shots around it, or press its ▶ to render it
-  on its own. The old take stays in Take history. The same prompt and seed give the same
-  picture unless something around it changed; use Reroll for a new one.
-- A reroll or bridge renders only that Shot, never a Shot still waiting further left. The
-  main button no longer renders other waiting Shots further down the chain on the way.
-- Standalone Shots are marked *standalone*; a join that is a hard cut shows **↯ hard cut**
-  with **Bridge** (on the Shot card and in Plan).
+**Rendering and the queue**
+1. Queue renders from any project, with OOM auto ComfyUI restart and one retry.
+2. Queue is kept in the browser: reload the tab and it carries on.
+3. Keep working while it renders: add Shots, references, settings, anchors, other projects.
+4. Yellow ▶ on a rendering or queued Shot queues another take of it.
+5. Multi-take (1–8 takes per render), seeds counting up so no take repeats.
+6. Seed mode next to the seed: Increment (+1 per Shot) or Fixed (same for every Shot).
+7. Render all, Render odd Shots, ▶ for a standalone Shot, gaps render as bridges.
+8. Up to 64 Shots per project.
+9. Clear all renders / Clear render: back to "not rendered", takes kept in history.
 
 **Reviewing**
-- **Stitched preview:** after Render odd Shots (or ▶ on a Shot while others are rendered),
-  the preview plays every rendered Shot back to back with the Shots not rendered yet left
-  out. Nothing is sampled; the marks on the scrub bar show the real Shot numbers.
-- **One by one:** when several Shots are under review, the main button becomes **✓ Approve
-  & review Shot N**. It moves the timeline to the start of Shot N (and keeps playing if it
-  was playing).
-- **Keys on the timeline:** with the scrub bar selected, **Space** plays / pauses and **← →**
-  step one frame, as everywhere else in the page.
+10. Timeline under the video: one block per Shot, ◀ take ▶ switches takes instantly.
+11. Every take gets its own clip; the whole film is decoded only for preview and final.
+12. Full screen with auto-hiding controls (move the mouse to the bottom to show them).
+13. Approve & review next jumps the player to the next Shot.
+14. Plan and Queue panels fold to one line; their buttons stay.
 
-**Editing Shots**
-- Editing a Shot's text, seconds or seed shows **▶ Render Shot N** right away, with
-  Approve off. Type it back exactly as it was and the Shot returns to its take and state;
-  nothing re-renders.
-- **One click on Render always works**, also straight from a Shot's text box.
-- **Reset Shot seeds** (next to the seed in Settings) puts the Shots' own seeds back to
-  auto. Approved Shots keep their seeds and takes; the notice offers **Reset approved Shots too**.
+**References, settings and anchors**
+15. Changes keep approved Shots, no dialog: a notice in the top bar offers Re-render everything.
+16. Only resolution and aspect ratio ask first (old takes can't be used at another size).
+17. Frame anchors: first/last-frame images at each join, in the Anchors column left of the Shots.
+18. Model menus grouped by subfolder.
+19. ◀ ▶ under each reference picture; drop an image on the editor to replace it.
 
-**Keeping approved Shots**
-- **Reference changes** (add, swap, edit, bypass, remove) keep approved Shots: they keep
-  their takes and the change applies from the next Shot you render. Nothing asks; a notice
-  right of the status bar says what changed, with **Re-render everything** if you want that
-  instead (× closes it).
-- **Settings changes** work the same: steps, sampler, scheduler, shifts, seed mode, Turbo,
-  LoRAs, model, text encoder, VAEs, reference image size and resize, Sage attention and
-  Style & Sound. Kept Shots keep the look of the old settings, so a big change (Turbo on /
-  off, another LoRA) can show between Shots; a different video VAE changes how every Shot
-  decodes, approved ones too.
-- Resolution, aspect and overlap still re-render everything (takes made at another size or
-  overlap can't be reused), as do the audio routes.
+**Output**
+20. Export approved clips to Approved_Clips, whole, with sound, numbered as on the timeline.
+21. Upscaled export only upscales newly approved Shots; stale clips leave the folder.
+22. Chunked RTX upscale for long films: flat RAM, chunk size in Settings.
+23. Videos saved in the project's own folder; optional PNG, silent MP4 and ProRes master.
+24. Free VRAM, Free RAM and Clear cache in the top bar.
 
-**Model menus**
-- Model, text encoder, VAE and LoRA menus group files under their subfolders (**H3**,
-  **H3 / Speed**…, files outside a subfolder under **Top level**), each line just the file
-  name. Hover a line for its full path.
-
-**References (Cast & Scenes)**
-- **◀ ▶ under each reference picture** step through the same list as its file menu.
-- **Drop an image on the open reference editor** to replace its picture; typed label and
-  description stay.
-
-**Output files**
-- **Export approved clips** (under the timeline, once a Shot is approved): each approved
-  Shot's own clip, **whole** (nothing hidden at the joins; trim in your editor), with sound,
-  into `output/longshot/<project>/Approved_Clips/` as `Shot 03 – seed 1724.mp4`, numbered as
-  on the timeline. Nothing is decoded: it's a copy, in seconds. The folder is emptied first,
-  so it always matches the timeline. Shots not approved yet are left out (the message says
-  how many). **Upscale with RTX** instead decodes each newly approved take on its own and
-  upscales it (scale and quality from Settings; with ProRes master on, also a `.mov` of
-  each), a frame at a time like the final; clips already upscaled from the same take and
-  settings are kept. **Open folder** in the message opens it.
-- **Upscale in chunks:** Upscale final video (and Update preview with Upscale previews on)
-  decodes the film once, then upscales it a frame at a time (the upscaler is set up once per
-  piece), straight into the encoder, so RAM holds the decoded film and little else; the upscaled frames never pile up, however
-  long the film. It's saved in pieces of **Chunks** seconds (next to Scale and Quality,
-  default 10 s; the status line shows "chunk 3 of 12"). ComfyUI keeps the decoded film
-  between pieces, so it isn't decoded again. The pieces and the sound are then joined into
-  the usual file (pictures copied, not encoded again), and the ProRes master the same way.
-  Stop removes the pieces; nothing half-finished is kept. If only the join fails, the
-  pieces are kept and the same button joins them again without upscaling anything. The joined file has no embedded
-  workflow. A film no longer than one piece renders in one go, as before. The RAM figure
-  under Upscale previews is the decoded film, which is what the upscale needs at its peak.
-- **Videos go into the project's folder:** `output/longshot/<project>/videos/`, next to its
-  takes. Older renders stay where they are and still play. Renaming a project moves its
-  videos too, and **Open output folder** opens that folder.
-- **Save PNG** and **Save audio-less MP4** (Settings, above *Saved takes*), both off by
-  default: only the video with sound is kept. Videos keep their embedded workflow metadata.
-- **ProRes master** (Settings, under the upscale settings, off by default): **Upscale final
-  video** also writes a 10-bit ProRes 422 HQ `.mov` with sound and workflow metadata next
-  to the MP4.
-- **Export:** **Include videos** (off by default) adds everything in the project's videos
-  folder; Import puts them back.
-- The project list shows a frame of the video when there's no PNG.
-- **Open input / output folder** brings the Explorer window to the front on Windows (if
-  Windows won't allow that, it flashes on the taskbar).
-
-**Projects**
-- **Delete…** can also delete the project's videos (and its timeline clips), next to its
-  takes and input folder.
-- **Open…** marks projects whose folders were deleted by hand with **files missing**.
-
-**Memory**
-- **Free VRAM**, **Free RAM** and **Clear cache** in the top bar, next to the RAM / GPU /
-  VRAM figures. Free RAM also unloads the models, so the next render loads them from disk;
-  Clear cache drops Long Shot's in-memory pieces (saved takes stay). Disabled while a
-  render runs.
-
-**Fixes**
-- Upscaling the final video a second time with nothing changed no longer says the preview
-  is out of date.
-- A render's leftover PNG / silent video is only removed for files that render made, never
-  for files ComfyUI reused from its cache.
-
-## What's new in 0.5.0
-
-Needs H3 Long Shot **1.5.0 or later**. Replace both folders, restart ComfyUI, then
-hard-refresh the Studio tab.
-
-**Clip Shots and joins**
-- **Clip Shots:** add a real video clip as a Shot, or replace a Shot with one
-  ("Replace with clip"). The Shots on either side render into and out of it; click the
-  join marker to make it a hard cut instead. Two clips side by side always cut.
-  An Advanced switch swaps the clip's original frames back in after upscaling.
-- **Bridge button** on the "↯ hard cut" flag re-renders the next Shot so it flows on
-  from the one before.
-
-**Re-rolling and building Shot by Shot**
-- **Reroll in place:** reroll any approved Shot, pinned at both ends, so the Shots
-  around it stay exactly as they are.
-- **Add Shots anywhere**, including before Shot 1 ("Shot before" / "Shot after").
-- **Take history** per Shot: step through earlier takes, switch instantly, delete ones
-  you don't want.
-- Approved Shots are locked to their take and seed, so they never re-render by accident.
-- Every join is checked; a broken one is flagged "↯ hard cut" and left for you to
-  reroll or bridge.
-- Segments saved by older versions are picked up automatically.
-
-**Layout**
-- **Top bar** shows RAM, GPU use and VRAM.
-- **Settings:** seed moved to the top; model selection, Turbo and LoRAs moved into
-  Advanced (under "Sampling").
-- **Decision row** split 25 / 50 / 25: Approve | Approve & render next | Reroll.
-
-**Models**
-- **Browse…** on every model field (MelBand included).
-- Add your own model folders (on the ComfyUI machine only).
-- Model names are matched across machines, so a project made on another PC finds
-  your copies.
-
-**Projects and files**
-- **Rename** moves the project's input and takes folders too.
-- **Missing references relink themselves** when you copy the file into the project's
-  input folder: identical contents relink silently, a same-name file asks first.
-- **Drag-and-drop audio upload.**
-- **Export / Import** a project as one .zip (references, audio, clips and takes;
-  "Include takes" is on by default). Works on the ComfyUI machine only.
-
-**Housekeeping**
-- Generic README with a git clone install; the example project was replaced by a
-  neutral test fixture.
+**Earlier (0.5)**
+25. Clip Shots: real video clips in the timeline, bridged into or hard-cut.
+26. Reroll in place, pinned to the Shots around it; Bridge fixes a hard cut.
+27. Add Shots anywhere; take history per Shot.
+28. Export / Import a project as one .zip; Rename moves its folders.
 
 ---
 
@@ -379,7 +104,7 @@ git clone https://github.com/kijai/ComfyUI-KJNodes
 git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
 ```
 
-Skip any you already have. If you already have H3 Long Shot, update it to 1.5.0 or
+Skip any you already have. If you already have H3 Long Shot, update it to 1.6.7 or
 later with `git pull` in its folder.
 
 Optional packs:
