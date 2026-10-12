@@ -32,6 +32,25 @@ function store(key, value) {           // browser storage: conveniences only
   return null;
 }
 
+/** Plan and Queue fold down to one line (kept per browser). */
+function applyFolds() {
+  let f = {};
+  try { f = JSON.parse(store("h3studio.folds") || "{}") || {}; } catch (e) { f = {}; }
+  for (const k of ["plan", "queue"]) {
+    const panel = document.getElementById(k + "-panel"), btn = panel && panel.querySelector("[data-fold]");
+    if (!panel) continue;
+    panel.classList.toggle("folded", !!f[k]);
+    if (btn) { btn.setAttribute("aria-expanded", String(!f[k])); btn.title = f[k] ? "Show everything" : "Show only one line"; }
+  }
+}
+function toggleFold(k) {
+  let f = {};
+  try { f = JSON.parse(store("h3studio.folds") || "{}") || {}; } catch (e) { f = {}; }
+  f[k] = !f[k];
+  store("h3studio.folds", JSON.stringify(f));
+  applyFolds();
+}
+
 const CLIENT_ID = (() => {
   let id = null;
   try { id = sessionStorage.getItem("h3studio.client"); } catch (e) { /* ignore */ }
@@ -169,7 +188,9 @@ function noteSeams(rows, chain, standalone) {
     if (next && next.kind !== "clip" && next.status !== "queued" && next.join !== "cut") next.seam = "mismatch";
   }
 }
-const renderingId = () => (S.busy && (S.busy.kind === "render" || S.busy.kind === "reroll") ? S.busy.target : null);
+/** A run of the open project is going (another project's run doesn't lock this one). */
+const busyHere = () => !!P() && ((!!S.busy && S.busy.slug === P().slug) || (!!S.chunking && S.chunking.slug === P().slug));
+const renderingId = () => (busyHere() && S.busy && (S.busy.kind === "render" || S.busy.kind === "reroll") ? S.busy.target : null);
 const clock = (iso) => (iso || "").slice(11, 16);
 
 /** Non-bypassed references whose file is gone (or never chosen). */
@@ -177,7 +198,9 @@ function missingRefs() {
   const clips = active().filter((s) => s.kind === "clip" &&
     (!s.clip.file || ["missing", "invalid"].includes(S.refState["clip:" + s.id])))
     .map((s) => ({ label: titleOf(s) + "'s clip" }));
-  return liveCast().filter((c) => !c.image || ["missing", "invalid"].includes(S.refState[c.id])).concat(clips);
+  const anchors = anchorKeys().filter((k) => anchorItem(k) && ["missing", "invalid"].includes(S.refState["anchor:" + k]))
+    .map((k) => ({ label: anchorTitle(k) }));
+  return liveCast().filter((c) => !c.image || ["missing", "invalid"].includes(S.refState[c.id])).concat(clips, anchors);
 }
 const audioMissing = () => !!P().audio.file && ["missing", "invalid"].includes(S.refState.audio);
 
@@ -303,7 +326,6 @@ async function loadProject(slug) {
   render();
   await Promise.all([loadInputs(), checkInputs(), loadSegStats(), loadClips(), fetchAllTakes()]);
   render();
-  ensureClips();
   autoCheck();
 }
 
@@ -327,6 +349,12 @@ async function checkInputs() {
     if (sh.kind === "clip" && sh.clip.file) {
       files.push({ key: "clip:" + sh.id, name: sh.clip.file, subfolder: sh.clip.subfolder, sha256: sh.clip.sha256 });
     }
+    if (sh.anchor_in && sh.anchor_in.file) {
+      files.push({ key: "anchor:" + sh.id, name: sh.anchor_in.file, subfolder: sh.anchor_in.subfolder, sha256: sh.anchor_in.sha256 });
+    }
+  }
+  if (p.anchor_end && p.anchor_end.file) {
+    files.push({ key: "anchor:end", name: p.anchor_end.file, subfolder: p.anchor_end.subfolder, sha256: p.anchor_end.sha256 });
   }
   if (!files.length) { S.refState = {}; return; }
   let res;
@@ -336,8 +364,12 @@ async function checkInputs() {
   for (const f of res.files) {
     state[f.key] = f.state;
     S.refInfo[f.key] = f;
-    const item = f.key === "audio" ? p.audio : f.key.startsWith("clip:") ? refItem(f.key) : p.cast.find((c) => c.id === f.key);
+    const item = f.key === "audio" ? p.audio : f.key.startsWith("clip:") || f.key.startsWith("anchor:") ? refItem(f.key) : p.cast.find((c) => c.id === f.key);
     if (!item) continue;
+    if (f.key.startsWith("anchor:")) {          // a frame anchor: just follow the file
+      if (f.state === "ok" || f.state === "changed") { item.sha256 = f.sha256; item.size_bytes = f.size_bytes; adopted = adopted || f.state === "changed"; }
+      continue;
+    }
     if (f.state === "ok" && f.sha256 && !item.sha256) {      // first check: remember the hash
       item.sha256 = f.sha256;
       item.size_bytes = f.size_bytes;
@@ -410,9 +442,10 @@ function refItem(key) {
   const p = P();
   if (key === "audio") return p.audio;
   if (key.startsWith("clip:")) { const sh = p.shots.find((x) => x.id === key.slice(5)); return sh && sh.clip; }
+  if (key.startsWith("anchor:")) return anchorItem(key.slice(7));
   return p.cast.find((c) => c.id === key);
 }
-function refName(key) { const it = refItem(key); return key === "audio" ? it.file : key.startsWith("clip:") ? it.file : it.image; }
+function refName(key) { const it = refItem(key); return key === "audio" || key.startsWith("clip:") || key.startsWith("anchor:") ? it.file : it.image; }
 function refLabel(key) {
   if (key === "audio") return "The song";
   if (key.startsWith("clip:")) { const sh = P().shots.find((x) => x.id === key.slice(5)); return sh ? `${titleOf(sh)}'s clip` : "A clip"; }
@@ -454,7 +487,7 @@ async function loadSegStats() {
  *  come back from disk. Only when ComfyUI is idle, so it never waits in line. */
 async function autoCheck() {
   const p = P();
-  if (!p || S.checkedFor === p.slug || S.busy || S.queuing || S.multi || S.chunking || S.conn !== "ok") return;
+  if (!p || S.checkedFor === p.slug || S.busy || S.queuing || S.chunking || S.applying || waitingJobs().length || S.conn !== "ok") return;
   const done = active().filter((s) => s.status !== "queued");
   if (!done.length || missingRefs().length) { S.checkedFor = p.slug; return; }
   try {
@@ -463,7 +496,7 @@ async function autoCheck() {
   } catch (e) { return; }
   S.checkedFor = p.slug;
   const upto = done[done.length - 1].id;
-  queue({ upto, dry: true, kind: "check", label: "Checking saved takes…", note: "Nothing is sampled",
+  runNow({ upto, dry: true, kind: "check", label: "Checking saved takes…", note: "Nothing is sampled",
     onDone: ({ rows, built }) => { S.dry = { rows, text: "", chain: built.chain }; } });
 }
 
@@ -632,9 +665,10 @@ function chainEnd(targetId) {
   return act[end].id;
 }
 
-/** One job at a time: building a prompt takes a moment, and two jobs started
- *  together (e.g. the reopen check and a clip job) must not both go out. */
-async function queue(opts) {
+/** Start one ComfyUI run now (the queue's jobs and the Studio's own small jobs:
+ *  clips, checks, chunks). One at a time: building a prompt takes a moment, and
+ *  two runs started together must not both go out. */
+async function runNow(opts) {
   if (S.busy || S.queuing) return;
   S.queuing = true;
   try { return await queueJob(opts); } finally { S.queuing = false; }
@@ -663,27 +697,29 @@ function wholeQueue(opts) {
     // the chunks of the last run are all saved; only the join failed: join again
     S.joinPending = null;
     J.opts = opts;
+    J.jobId = opts.jobId || null;
     S.error = null;
     S.chunking = J;
-    return chunkJoin(J);
+    return chunkJoin(J, true);
   }
   S.joinPending = null;
-  if (!upscales || filmSeconds() <= vsrChunkS() + 0.5) return queue(opts);
-  const C = { opts, slug: P().slug, L: Math.max(24, Math.round(vsrChunkS() * FPS)), n: 0, k: 0,
+  if (!upscales || filmSeconds() <= vsrChunkS() + 0.5) return runNow(opts);
+  const C = { opts, slug: P().slug, jobId: opts.jobId || null, L: Math.max(24, Math.round(vsrChunkS() * FPS)), n: 0, k: 0,
     files: [], masters: [], audio: null, prefix: null, done: null };
   S.chunking = C;
   return chunkRun(C);
 }
 
-async function chunkRun(C) {
+async function chunkRun(C, inCtx = true) {
+  if (!inCtx) return inProject(C.slug, () => chunkRun(C, true));
   const i = C.k, o = C.opts;
-  await queue(Object.assign({}, o, {
+  await runNow(Object.assign({}, o, {
     chunk: { index: i, start: i * C.L, length: C.L, audio: i === 0 },
     label: `${o.label} · chunk ${i + 1}${C.n ? " of " + C.n : ""}`,
     note: i === 0 ? "Decoding the film, then upscaling it a chunk at a time" : "The decoded film is reused · upscaling the next chunk",
     onDone: (res) => chunkDone(C, res),
   }));
-  if (!S.busy && S.chunking === C && C.k === i) chunkEnd(C, false);   // didn't start (S.error says why)
+  if (!S.busy && S.chunking === C && C.k === i) chunkEnd(C, false, S.error || "A chunk didn't start.");   // didn't start
 }
 
 function chunkDone(C, { rows, text, outputs, built, sent }) {
@@ -702,18 +738,21 @@ function chunkDone(C, { rows, text, outputs, built, sent }) {
 
 async function chunkNext(C, ok) {
   if (S.chunking !== C) return;
-  if (!ok || !C.done || C.k === 0) { chunkEnd(C, false); return; }
-  if (C.k < C.n) { chunkRun(C); return; }
+  if (C.stopRequested) { chunkEnd(C, false, "Stopped."); return; }
+  if (!ok || !C.done || C.k === 0) { chunkEnd(C, false, S.lastSwapError || S.error || "The upscale stopped."); return; }
+  if (C.k < C.n) { chunkRun(C, false); return; }
   chunkJoin(C);
 }
 
 /** Every chunk is saved: join them with the sound. If that fails the chunks are
  *  kept, and the same button tries the join again (nothing is upscaled again). */
-async function chunkJoin(C) {
+async function chunkJoin(C, inCtx = false) {
+  if (!inCtx) return inProject(C.slug, () => chunkJoin(C, true));
   C.joining = true;
   toast(`Joining ${C.n} chunks…`);
   render();
   const { rows, text, built, sent } = C.done;
+  const job = C.jobId && Q.jobs.find((j) => j.id === C.jobId);
   try {
     const out = await api(`/longshot/chunks/${encodeURIComponent(P().slug)}/join`, { method: "POST",
       body: { prefix: C.prefix, chunks: C.files, audio: C.audio, masters: C.masters } });
@@ -728,22 +767,25 @@ async function chunkJoin(C) {
     C.joining = false;
     S.joinPending = C;
     render();
+    if (job) endJob(job, "failed", "Joining the upscaled chunks failed: " + e.message);
     return;
   }
   render();
   saveNow();
-  setTimeout(ensureClips, 0);
+  if (job) endJob(job, "done");
 }
 
 /** Stopped or failed: nothing half-finished is kept. */
-function chunkEnd(C, ok) {
+function chunkEnd(C, ok, why) {
   if (S.chunking === C) S.chunking = null;
   if (!ok) {
-    api(`/longshot/chunks/${encodeURIComponent(P().slug)}/discard`, { method: "POST", body: {} }).catch(() => {});
-    if (!S.error && C.k > 0) toast("The upscale stopped; its chunks were removed.");
+    api(`/longshot/chunks/${encodeURIComponent(C.slug)}/discard`, { method: "POST", body: {} }).catch(() => {});
+    if (C.slug === P().slug && !S.error && C.k > 0) toast("The upscale stopped; its chunks were removed.");
   }
+  const job = C.jobId && Q.jobs.find((j) => j.id === C.jobId);
+  if (job) endJob(job, ok ? "done" : /stopp/i.test(why || "") ? "stopped" : "failed", ok ? null : why);
   render();
-  setTimeout(ensureClips, 0);
+  setTimeout(queueNext, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -760,81 +802,413 @@ async function askMulti(what) {
   const n = multiTakes();
   if (n <= 1) return 1;
   const ans = await confirmBox({ title: `Multi-take is ${n}`,
-    body: `${what} renders ${n} times, one after another, each time with new seeds, so it takes about ${n}× as long. ` +
+    body: `${what} renders ${n} times, one after another, take 2 with take 1's seed + 1, take 3 with + 2 and so on (no take repeats), so it takes about ${n}× as long. ` +
       "Every take is kept. Afterwards each Shot shows take 1 of the batch; review the others with ◀ ▶ on the timeline. " +
       "Stop ends the batch.",
     yes: `Render ${n} takes`, alt: "Just 1 take", no: "Cancel" });
   return ans === true ? n : ans === "alt" ? 1 : 0;
 }
 
-/** Start a render that may repeat: `again` queues one pass (returns queue()'s
- *  promise); `ids` are the Shots each pass renders. */
-async function multiGo(of, ids, again) {
-  S.multi = of > 1 ? { of, k: 1, ids: ids.slice(), first: {}, again } : null;
-  await again();
-  if (!S.busy && S.multi && S.multi.k === 1) S.multi = null;      // didn't start
-}
-
 const TAKE_FIELDS = ["take", "shot_seed", "window", "take_seconds", "rendered", "standalone", "seam", "edit_from"];
 
-/** A pass finished. Another pass: new seeds for its Shots, render them again
- *  (true). Last pass: every Shot back on its take 1 (false). */
-function multiNext(ok) {
-  const m = S.multi;
-  if (!m) return false;
-  if (m.k === 1 && ok) {
-    for (const id of m.ids) {
-      const s = P().shots.find((x) => x.id === id);
-      if (s && s.take && s.status !== "queued") m.first[id] = JSON.parse(JSON.stringify(pickFields(s, TAKE_FIELDS)));
-    }
-    m.seams = Object.fromEntries(P().shots.map((s) => [s.id, s.seam === undefined ? null : s.seam]));
+// ---------------------------------------------------------------------------
+// The render queue: every render is a job; jobs run one after another, from any
+// project. A job is a plain description (project, what to render), turned into
+// a ComfyUI run when it starts, in its own project, whichever project is open.
+// Saved in this browser, so a reload picks the queue up again.
+// ---------------------------------------------------------------------------
+
+const Q = { jobs: [], groups: {}, paused: false, seq: 0 };
+const QKEY = "h3studio.queue";
+
+function saveQueue() {
+  try { localStorage.setItem(QKEY, JSON.stringify({ jobs: Q.jobs, groups: Q.groups, paused: Q.paused, seq: Q.seq })); }
+  catch (e) { /* storage full or off: the queue still runs */ }
+}
+function loadQueue() {
+  try {
+    const d = JSON.parse(localStorage.getItem(QKEY) || "null");
+    if (!d) return;
+    Q.jobs = Array.isArray(d.jobs) ? d.jobs : [];
+    Q.groups = d.groups || {};
+    Q.paused = !!d.paused;
+    Q.seq = d.seq || 0;
+    // a job that was running when the page closed runs again (finished segments are reused)
+    for (const j of Q.jobs) if (j.state === "running") j.state = "waiting";
+  } catch (e) { /* a broken entry: start empty */ }
+}
+const waitingJobs = () => Q.jobs.filter((j) => j.state === "waiting");
+const liveJob = (j) => j.state === "waiting" || j.state === "running";
+/** The open project's waiting / running job that renders Shot `id`, if any. */
+function jobFor(id) {
+  return Q.jobs.find((j) => liveJob(j) && j.slug === P().slug && (j.ids || []).includes(id)) || null;
+}
+const jobPos = (j) => waitingJobs().indexOf(j) + 1;
+
+/** Text for a queue row: "Shot 05 · take 3", "Render all · Shots 1–5 · take 1 of 2"… */
+function jobTitle(spec, pass, of, ids) {
+  const pad = (id) => "Shot " + String(numOf(id)).padStart(2, "0");
+  const takeNo = (id) => {
+    const have = (S.takes[id] || []).length;
+    return have || pass > 1 ? `take ${have + pass}` : "";
+  };
+  const ofTxt = of > 1 ? ` (${pass} of ${of})` : "";
+  const mode = spec.mode === "alone" ? " · on its own" : spec.kind === "reroll" ? " · reroll" : "";
+  switch (spec.type) {
+    case "shot": { const t = takeNo(spec.target); return `${pad(spec.target)}${mode}${t ? " · " + t : ""}${ofTxt}`; }
+    case "all": return `Render all · ${ids.length} Shot${ids.length > 1 ? "s" : ""} (${numOf(ids[0])}–${numOf(ids[ids.length - 1])})${of > 1 ? ` · take ${pass} of ${of}` : ""}`;
+    case "through": return `Re-render through ${pad(spec.target)}`;
+    case "final": return "Upscale final video";
+    case "preview": return "Update preview";
+    case "export": return "Export approved clips · upscaled";
+    default: return spec.type;
   }
-  if (!ok || m.k >= m.of) { multiEnd(ok); return false; }
-  m.k++;
-  for (const id of m.ids) {
+}
+
+/** Add jobs: `specs` (one or more) × `takes` passes. Several passes share a
+ *  group: afterwards every Shot shows take 1 of the batch (Multi-take). */
+function enqueue(specs, takes = 1) {
+  specs = (Array.isArray(specs) ? specs : [specs]).filter(Boolean);
+  if (!specs.length) return;
+  const idsOf = (sp) => sp.type === "all" ? sp.ids.slice() : sp.target ? [sp.target] : [];
+  let group = null;
+  if (takes > 1) {
+    group = "g" + (++Q.seq);
+    Q.groups[group] = { slug: P().slug, ids: [...new Set(specs.flatMap(idsOf))], of: takes, first: {}, seams: null };
+  }
+  const was = waitingJobs().length + (S.busy || S.chunking ? 1 : 0);
+  for (let k = 1; k <= takes; k++) {
+    for (const spec of specs) {
+      const ids = idsOf(spec);
+      Q.jobs.push({ id: "j" + (++Q.seq), slug: P().slug, name: P().name, spec, ids, pass: k, of: takes, group,
+        title: jobTitle(spec, k, takes, ids), state: "waiting", added: Date.now() });
+    }
+  }
+  saveQueue();
+  renderQueue();
+  render();
+  if (was > 0 || Q.paused) {
+    const n = specs.length * takes;
+    toast(`${n === 1 ? "Added" : `Added ${n} jobs`} to the queue${Q.paused ? " (paused)" : ` · ${was} ahead`}.`);
+  }
+  queueNext();
+}
+
+/** Run a function with `slug` as the open project. When it isn't the open one,
+ *  it's loaded, the function runs with it (nothing is drawn meanwhile), it's
+ *  saved, and the open project comes back exactly as it was. */
+const VIEW_KEYS = ["project", "dry", "error", "refState", "refInfo", "segStats", "takes", "clips", "focus", "open",
+  "clipTried", "clipsReady", "gen", "bad", "checkedFor", "loop", "saveState", "conflict", "inputs", "joinPending"];
+const swapEvents = [];
+async function inProject(slug, fn) {
+  while (S.applying) await new Promise((r) => setTimeout(r, 60));
+  S.applying = true;
+  try {
+    if (P() && P().slug === slug) return await fn(true);
+    const raw = await api("/longshot/projects/" + encodeURIComponent(slug));
+    const keep = {};
+    for (const k of VIEW_KEYS) keep[k] = S[k];
+    const timer = saveTimer;
+    clearTimeout(saveTimer);
+    S.swapped = true;
+    S.project = normalize(raw);
+    Object.assign(S, { dry: null, error: null, refState: {}, refInfo: {}, segStats: null, takes: {}, clips: {},
+      focus: null, open: null, clipTried: new Set(), clipsReady: false, gen: 0, bad: {}, conflict: null, joinPending: keep.joinPending });
+    try {
+      await loadClips();             // (no file check here: it could ask a question mid-swap)
+      return await fn(false);
+    } finally {
+      clearTimeout(saveTimer);
+      try {
+        const res = await api("/longshot/projects/" + encodeURIComponent(slug) + "?base=" + encodeURIComponent(P().saved_at || ""),
+          { method: "PUT", body: P() });
+        P().saved_at = res.saved_at;
+      } catch (e) { /* the next run of this project reports it */ }
+      const err = S.error;
+      for (const k of VIEW_KEYS) S[k] = keep[k];
+      S.lastSwapError = err;
+      S.swapped = false;
+      if (timer) scheduleSave();
+    }
+  } finally {
+    S.applying = false;
+    setTimeout(queueNext, 0);          // whatever ended while this ran can start the next job now
+    if (!S.swapped) {
+      render();
+      renderQueue();
+      // typing that landed while another project was in place
+      for (const [type, el] of swapEvents.splice(0)) if (el.isConnected) el.dispatchEvent(new Event(type, { bubbles: true }));
+    }
+  }
+}
+
+/** The run options of a job, worked out when it starts, in its own project. */
+function jobOpts(job) {
+  const sp = job.spec, take = job.of > 1 ? ` · take ${job.pass} of ${job.of}` : "";
+  const shot = (id) => P().shots.find((x) => x.id === id && !x.bypassed);
+  if (sp.type === "shot" || sp.type === "through") {
+    const s = shot(sp.target);
+    if (!s || s.kind === "clip") return null;
+    const n = numOf(s.id), verb = sp.kind === "reroll" ? "Re-rolling" : "Rendering";
+    const seed = sp.kind === "reroll" && Number(s.shot_seed) >= 0 ? ` · seed ${s.shot_seed}` : "";
+    if (sp.mode === "alone") {
+      return { upto: s.id, kind: sp.kind, standalone: true, label: `${verb} Shot ${n} on its own${seed}${take}`,
+        note: "A fresh start from the references · no pins to the Shots around it", onDone: onRendered(s.id, true) };
+    }
+    if (sp.mode === "pinned") {
+      const pin = pinnedNote(s);
+      return { upto: s.id, kind: sp.kind, trimLeft: true, label: `${verb} Shot ${n}${pin ? " · " + pin : ""}${seed}${take}`,
+        note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) };
+    }
+    const others = active().filter((x) => x !== s && isRendered(x)).length;
+    return { upto: s.id, kind: sp.kind, label: sp.type === "through" ? `Re-rendering through Shot ${n}` : `${verb} Shot ${n}${seed}${take}`,
+      note: sp.type === "through" ? "Kept takes re-continue with their own seeds"
+        : others ? `${others} Shot${others > 1 ? "s" : ""} load${others > 1 ? "" : "s"} ${others > 1 ? "their" : "its"} take · only Shot ${n} renders`
+          : n > 1 ? `Shots 1–${n - 1} reused · only Shot ${n} renders` : "Rendering Shot 1",
+      onDone: onRendered(s.id) };
+  }
+  if (sp.type === "all") {
+    const ids = sp.ids.filter((id) => shot(id));
+    if (!ids.length) return null;
+    const last = ids[ids.length - 1];
+    const others = active().filter((x) => isRendered(x) && !ids.includes(x.id)).length;
+    return { upto: last, kind: "render", label: `Rendering all · ${ids.length} Shot${ids.length > 1 ? "s" : ""}${take}`,
+      note: others ? `${others} rendered Shot${others > 1 ? "s keep their takes" : " keeps its take"} · each new Shot continues from the one before`
+        : "Each Shot continues from the one before",
+      onDone: (args) => {
+        onRendered(last)(args);
+        S.focus = ids[0];                        // review from the first Shot that rendered
+        if (!elsewhere(args.built.chain)) S.open = ids[0];
+        loadVideo(undefined, ids[0]);
+      } };
+  }
+  if (sp.type === "final") return finalOpts();
+  if (sp.type === "preview") return previewOpts(sp.focus);
+  if (sp.type === "export") {
+    const items = approvedForExport();
+    if (!items.length) return null;
+    const v = P().settings.rtx_vsr || {};
+    const skipped = active().filter((x) => x.kind !== "clip" && x.status !== "approved").length;
+    return { kind: "export", exportClips: items.map((x) => ({ take: x.take })),
+      label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}`,
+      note: "Each approved take decoded on its own, whole, and upscaled a frame at a time",
+      extra: { items: items.map((x) => ({ name: x.name })), skipped }, onDone: () => {} };
+  }
+  return null;
+}
+
+const Q_ICON = { waiting: "○", running: "◌", done: "✓", failed: "!", stopped: "■", skipped: "–" };
+
+function renderQueue() {
+  if (S.swapped || !$("queue")) return;
+  const wait = waitingJobs().length, live = Q.jobs.filter(liveJob).length;
+  $("queue-count").textContent = live ? `· ${live} to go${Q.paused ? " · paused" : ""}` : Q.paused ? "· paused" : "";
+  $("queue-pause").textContent = Q.paused ? "Resume" : "Pause";
+  $("queue-pause").setAttribute("aria-pressed", Q.paused);
+  $("queue-clear").hidden = !Q.jobs.some((j) => !liveJob(j));
+  if (!Q.jobs.length) {
+    $("queue").innerHTML = '<div class="q-empty peek">Nothing queued. Every render goes here and runs in order, from any project, so you can line up work and let it run.</div>';
+    return;
+  }
+  const time = (t) => t ? new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const offline = S.conn !== "ok";
+  const peek = Q.jobs.find((j) => j.state === "running") || Q.jobs.find((j) => j.state === "waiting") || Q.jobs[Q.jobs.length - 1];
+  $("queue").innerHTML = Q.jobs.map((j) => {
+    const here = P() && j.slug === P().slug;
+    let sub = "", bar = "";
+    if (j.state === "running") {
+      const b = S.busy && S.busy.jobId === j.id ? S.busy : null;
+      const pct = b ? progressOf(b) : 1;
+      sub = b ? `${b.label}${b.note ? " · " + b.note : ""}` : S.restarting ? "Waiting for ComfyUI to restart…" : "Starting…";
+      bar = `<div class="q-bar"><div style="width:${pct}%"></div></div>`;
+    } else if (j.state === "waiting") {
+      const pos = jobPos(j);
+      sub = j.error ? j.error : offline ? "Waits for ComfyUI to be back" : Q.paused ? "Paused" : pos === 1 && (S.busy || S.chunking) ? "Next" : `#${pos} in line`;
+    } else if (j.state === "done") sub = `Done · ${time(j.ended)}`;
+    else if (j.state === "skipped") sub = j.error || "Skipped";
+    else sub = `${j.state === "stopped" ? "Stopped" : "Failed"} · ${time(j.ended)}${j.error ? " · " + j.error : ""}`;
+    const w = j.state === "waiting", idx = waitingJobs().indexOf(j);
+    const acts = w ? `<button class="ghost sm" data-action="queue-up"${idx <= 0 ? " disabled" : ""} aria-label="Move up">▲</button>
+        <button class="ghost sm" data-action="queue-down"${idx < 0 || idx >= wait - 1 ? " disabled" : ""} aria-label="Move down">▼</button>
+        <button class="ghost sm" data-action="queue-remove" aria-label="Remove from the queue">${CROSS}</button>`
+      : j.state === "running" ? `<button class="ghost sm" data-action="queue-stop" title="Stop this job; the queue goes on">Stop</button>`
+      : `${j.state === "failed" || j.state === "stopped" ? '<button class="ghost sm" data-action="queue-retry" title="Run it again">↻</button>' : ""}
+        <button class="ghost sm" data-action="queue-remove" aria-label="Remove from the list">${CROSS}</button>`;
+    return `<div class="q-row st-${j.state}${j === peek ? " peek" : ""}" data-job="${esc(j.id)}">
+      <span class="q-icon" aria-hidden="true">${Q_ICON[j.state] || "·"}</span>
+      <span class="q-main"><button class="q-name${here ? " here" : ""}" data-action="queue-open" title="${here ? "The open project" : "Open this project"}">${esc(j.name)}</button>
+        · ${esc(j.title)}<div class="q-sub">${esc(sub)}</div>${bar}</span>
+      <span class="q-act">${acts}</span></div>`;
+  }).join("");
+}
+
+async function queueAction(action, el) {
+  const row = el.closest("[data-job]");
+  const job = row && Q.jobs.find((j) => j.id === row.dataset.job);
+  if (action === "queue-pause") { Q.paused = !Q.paused; saveQueue(); renderQueue(); if (!Q.paused) queueNext(); return; }
+  if (action === "queue-clear") {
+    const gone = Q.jobs.filter((j) => !liveJob(j)).map((j) => j.group);
+    Q.jobs = Q.jobs.filter(liveJob);
+    for (const g of gone) if (g && Q.groups[g] && !Q.jobs.some((j) => j.group === g)) delete Q.groups[g];
+    saveQueue(); renderQueue(); return;
+  }
+  if (!job) return;
+  if (action === "queue-open") { if (job.slug !== P().slug) switchProject(job.slug); return; }
+  if (action === "queue-stop") { if (S.busy && S.busy.jobId === job.id) stop(); else if (S.chunking && S.chunking.jobId === job.id) stop(); return; }
+  if (action === "queue-retry") { job.state = "waiting"; job.error = null; job.attempts = 0; saveQueue(); renderQueue(); queueNext(); return; }
+  if (action === "queue-remove") {
+    if (job.state === "running") return;
+    Q.jobs = Q.jobs.filter((j) => j !== job);
+    const g = job.group;
+    saveQueue(); renderQueue(); render();
+    if (g && Q.groups[g] && !Q.jobs.some((j) => j.group === g && liveJob(j))) finishGroup(g);
+    return;
+  }
+  if (action === "queue-up" || action === "queue-down") {
+    const w = waitingJobs(), i = w.indexOf(job), k = action === "queue-up" ? i - 1 : i + 1;
+    if (i < 0 || k < 0 || k >= w.length) return;
+    const a = Q.jobs.indexOf(w[i]), b = Q.jobs.indexOf(w[k]);
+    [Q.jobs[a], Q.jobs[b]] = [Q.jobs[b], Q.jobs[a]];
+    saveQueue(); renderQueue();
+  }
+}
+
+/** Before a later pass of a Multi-take batch: new seeds for its Shots. */
+function preparePass(job) {
+  if (!(job.pass > 1)) return;
+  for (const id of job.ids) {
     const s = P().shots.find((x) => x.id === id);
-    if (!s || s.bypassed || !m.first[id]) continue;
+    if (!s || s.bypassed || s.kind === "clip") continue;
     rememberTake(s);
-    s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
+    s.shot_seed = passSeed(job, s);
     s.status = "queued";
     s.was_approved = s.was_rendered = false;
     s.edit_from = null;
   }
   S.dry = null;
-  commit();
-  setTimeout(async () => {
-    if (S.multi !== m) return;
-    await m.again();
-    if (!S.busy && S.multi === m) multiEnd(false);
-  }, 0);
-  return true;
 }
 
-/** The batch is over (finished, stopped or failed): every Shot it rendered goes
- *  back to its take 1, under review. The other takes stay in its take list. */
-function multiEnd(ok) {
-  const m = S.multi;
-  S.multi = null;
-  if (!m) return;
+/** Multi-take: take k of a Shot uses take 1's seed + (k − 1), so no two takes
+ *  repeat. Without take 1's seed (it failed), the seed after the last take. */
+function passSeed(job, s) {
+  const g = job.group && Q.groups[job.group];
+  const base = g && g.base ? Number(g.base[s.id]) : NaN;
+  const prev = Number(s.shot_seed);
+  const seed = Number.isFinite(base) && base >= 0 ? base + job.pass - 1
+    : Number.isFinite(prev) && prev >= 0 ? prev + 1 : Math.floor(Math.random() * (SEED_MAX + 1));
+  return seed % (SEED_MAX + 1);
+}
+
+/** After pass 1 of a batch: remember each Shot's take 1 (and the joins). */
+function rememberPassOne(job) {
+  const g = job.group && Q.groups[job.group];
+  if (!g || job.pass !== 1) return;
+  for (const id of job.ids) {
+    const s = P().shots.find((x) => x.id === id);
+    if (s && s.take && s.status !== "queued") g.first[id] = JSON.parse(JSON.stringify(pickFields(s, TAKE_FIELDS)));
+    if (s && Number(s.shot_seed) >= 0) (g.base = g.base || {})[id] = Number(s.shot_seed);
+  }
+  g.seams = Object.assign(g.seams || {}, Object.fromEntries(P().shots.map((x) => [x.id, x.seam === undefined ? null : x.seam])));
+  saveQueue();
+}
+
+/** A batch is over: every Shot it rendered goes back to its take 1, under review. */
+async function finishGroup(gid) {
+  const g = Q.groups[gid];
+  delete Q.groups[gid];
+  saveQueue();
+  if (!g || !Object.keys(g.first).length) return;
   let firstId = null;
-  for (const id of m.ids) {
-    const s = P().shots.find((x) => x.id === id), t = m.first[id];
-    if (!s || !t) continue;
-    Object.assign(s, JSON.parse(JSON.stringify(t)));
-    if (s.status === "queued") s.status = "review";
-    s.was_approved = s.was_rendered = false;
-    if (!firstId) firstId = id;
+  await inProject(g.slug, async (here) => {
+    for (const id of g.ids) {
+      const s = P().shots.find((x) => x.id === id), t = g.first[id];
+      if (!s || !t) continue;
+      Object.assign(s, JSON.parse(JSON.stringify(t)));
+      if (s.status === "queued") s.status = "review";
+      s.was_approved = s.was_rendered = false;
+      if (!firstId) firstId = id;
+    }
+    if (firstId && g.seams) for (const s of P().shots) if (s.id in g.seams) s.seam = g.seams[s.id];
+    S.dry = null;
+    if (here) {
+      commit();
+      if (firstId) { S.focus = S.open = firstId; loadVideo(undefined, firstId); }
+    }
+  });
+  if (firstId) toast(`${g.of} takes rendered${g.slug !== P().slug ? ` in ${jobProjectName(g.slug)}` : ""}. Each Shot shows take 1 of the batch; ◀ ▶ on the timeline shows the others.`);
+}
+const jobProjectName = (slug) => (Q.jobs.find((j) => j.slug === slug) || {}).name || slug;
+
+const OOM_RE = /out of memory|outofmemory|not enough memory|cuda error: out of memory|failed to allocate|allocat\w* .*bytes/i;
+
+/** A job is over: done, failed, stopped or skipped. Out of memory: ComfyUI is
+ *  restarted and the job runs once more. */
+function endJob(job, state, error) {
+  if (!job || !liveJob(job)) return;
+  if (state === "failed" && OOM_RE.test(error || "") && !(job.attempts >= 1)) {
+    job.attempts = (job.attempts || 0) + 1;
+    job.state = "waiting";
+    job.error = "Out of memory: restarting ComfyUI, then trying again";
+    saveQueue();
+    renderQueue();
+    autoRestart();
+    return;
   }
-  // the joins are as they were with the takes of pass 1
-  if (firstId && m.seams) for (const s of P().shots) if (s.id in m.seams) s.seam = m.seams[s.id];
-  S.dry = null;
-  commit();
-  if (firstId) {
-    S.focus = S.open = firstId;
-    loadVideo(undefined, firstId);
-    toast(ok ? `${m.of} takes rendered. Each Shot shows take 1 of the batch; ◀ ▶ on the timeline shows the others.`
-      : `Multi-take stopped after ${Math.max(1, m.k - 1)} of ${m.of}. Each Shot shows take 1 of the batch; ◀ ▶ shows the others.`);
+  job.state = state;
+  job.error = error || null;
+  job.ended = Date.now();
+  if (state === "failed" && OOM_RE.test(error || "")) job.error = "Out of memory twice: " + error;
+  saveQueue();
+  renderQueue();
+  const g = job.group;
+  if (g && Q.groups[g] && !Q.jobs.some((j) => j.group === g && liveJob(j))) finishGroup(g).then(() => queueNext());
+  else setTimeout(queueNext, 0);
+}
+
+/** Start the next waiting job when nothing is running. */
+async function queueNext() {
+  if (!S.ready || S.queueStarting || S.busy || S.queuing || S.chunking || S.applying || S.restarting || Q.paused) return;
+  if (S.conn !== "ok") { renderQueue(); return; }
+  const job = waitingJobs()[0];
+  if (!job) { renderQueue(); return; }
+  S.queueStarting = true;
+  job.state = "running";
+  job.error = null;
+  job.started = Date.now();
+  saveQueue();
+  renderQueue();
+  let outcome = null;
+  try {
+    await inProject(job.slug, async () => {
+      preparePass(job);
+      const o = jobOpts(job);
+      if (!o) { outcome = ["skipped", "Its Shots were removed or bypassed."]; return; }
+      o.jobId = job.id;
+      S.error = null;
+      if (job.spec.type === "final" || job.spec.type === "preview") await wholeQueue(o);
+      else await runNow(o);
+      const started = (S.busy && S.busy.jobId === job.id) || (S.chunking && S.chunking.jobId === job.id);
+      // (a join retried from saved chunks can be over already)
+      if (!started && job.state === "running") outcome = ["failed", S.error || "It didn't start."];
+    });
+  } catch (e) {
+    outcome = ["failed", e.status === 404 ? "Its project was deleted." : e.message];
+  } finally {
+    S.queueStarting = false;
   }
+  if (outcome) endJob(job, outcome[0], outcome[1]);
+  renderQueue();
+}
+
+/** ComfyUI ran out of memory: restart it; the queue goes on when it's back. */
+async function autoRestart() {
+  if (S.restarting) return;
+  S.restarting = Date.now();
+  S.autoRestart = true;
+  renderHeader();
+  toast("Out of memory: restarting ComfyUI, then the queue goes on.");
+  try { await api("/longshot/restart", { method: "POST" }); }
+  catch (e) { S.restarting = null; S.autoRestart = false; renderHeader(); setTimeout(queueNext, 2000); }
 }
 
 function pickFields(o, keys) {
@@ -844,7 +1218,7 @@ function pickFields(o, keys) {
 }
 
 async function queueJob({ upto, dry, kind, label, note, onDone, final = false, standalone = false, batch = null,
-  omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null }) {
+  omit = null, trimLeft = false, takeClips = null, chunk = null, exportClips = null, extra = null, jobId = null }) {
   if (S.busy) return;
   if (Object.keys(S.uploading).length) { toast("Wait for the image upload to finish."); return; }
   S.error = null;
@@ -865,7 +1239,6 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
     if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     return;
   }
-  if (S.multi && (kind === "render" || kind === "reroll")) label += ` · take ${S.multi.k} of ${S.multi.of}`;
   let project = sendable(P());          // seeds are settled on the whole timeline first
   const target = upto;
   if (!standalone && !omit && (kind === "render" || kind === "reroll" || kind === "refresh")) upto = chainEnd(upto);
@@ -917,10 +1290,12 @@ async function queueJob({ upto, dry, kind, label, note, onDone, final = false, s
   for (const sh of project.shots) sent[sh.id] = { text: sh.text || "", seconds: Number(sh.seconds) };
   S.busy = {
     promptId: res.prompt_id, kind, target, label, note, baseNote: note, built, onDone, sent, batch, standalone, extra,
+    jobId, slug: P().slug, project: P().name,
     of: built.chain.length, segs: {}, segT0: {}, step: 0, phase: "queued", started: Date.now(),
   };
   if (kind === "render" || kind === "reroll") S.open = target;
   render();
+  renderQueue();
   pollLater();
 }
 
@@ -967,6 +1342,19 @@ async function finish(promptId, entry) {
     }
   }
   S.busy = null;
+  let res = {};
+  try {
+    // the run's own project, whichever is open now
+    res = (await inProject(b.slug || P().slug, () => finishIn(b, promptId, entry))) || {};
+  } catch (e) { res = { ok: false, error: e.message }; }
+  const job = b.jobId && Q.jobs.find((j) => j.id === b.jobId);
+  if (job && !res.more) endJob(job, res.ok ? "done" : res.stopped ? "stopped" : "failed", res.error);
+  if (!res.more) setTimeout(queueNext, 0);
+  renderQueue();
+}
+
+/** What a finished run did, applied to its project (the open one or not). */
+async function finishIn(b, promptId, entry) {
   if (b.kind === "render" || b.kind === "reroll" || b.kind === "refresh") S.takes = {};   // take lists changed
   const status = (entry && entry.status) || {};
   const msgs = status.messages || [];
@@ -1034,32 +1422,27 @@ async function finish(promptId, entry) {
     loadSegStats().then(renderSettings);
     saveNow();                       // save right after every finished render
   } else scheduleSave();
-  // Render odd Shots: the next one in the list, unless this one failed or was stopped
   const ok = !failed && !stopped && !b.stopped && !S.error && !!entry;
+  // Multi-take: pass 1's takes are the ones each Shot shows when the batch is over
+  const job = b.jobId && Q.jobs.find((j) => j.id === b.jobId);
+  if (ok && job) rememberPassOne(job);
+  // Chunked upscale: the next chunk, or join them (the job goes on)
   let more = false;
-  if (b.batch) {
-    const rest = b.batch.ids.filter((id) => { const x = P().shots.find((y) => y.id === id); return x && !x.bypassed && x.status === "queued"; });
-    if (ok && rest.length) {
-      more = true;
-      setTimeout(() => renderAlone(P().shots.find((x) => x.id === rest[0]), { ids: rest.slice(1), of: b.batch.of }), 0);
-    } else if (!ok && rest.length) toast(`Render odd Shots stopped; ${rest.length} Shot${rest.length > 1 ? "s" : ""} still to render.`);
-  }
-  // Chunked upscale: the next chunk, or join them
-  if (!more && S.chunking && (b.kind === "final" || b.kind === "refresh")) {
+  if (S.chunking && (b.kind === "final" || b.kind === "refresh") && S.chunking.slug === P().slug) {
     more = true;
     const C = S.chunking;
     setTimeout(() => chunkNext(C, ok), 0);
   }
-  // Multi-take: the next pass, or every Shot back on take 1 of the batch
-  if (!more && S.multi && (b.kind === "render" || b.kind === "reroll")) more = multiNext(ok);
-  if (!more) setTimeout(ensureClips, 0);           // takes still without a clip get one
+  return { ok, more, stopped: !!(stopped || b.stopped),
+    error: ok ? null : S.error || (stopped || b.stopped ? "Stopped." : !entry ? "ComfyUI has no record of the run." : "It failed.") };
 }
 
 /** "Update preview" under the timeline: the exact video of every rendered Shot
  *  (Shots not rendered yet left out). Nothing is sampled. */
 function updatePreview() {
-  if (busyGuard()) return;
-  stitchPreview(S.focus, true);
+  if (!active().some(isRendered)) return;
+  if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "preview")) { toast("Update preview is already in the queue."); return; }
+  enqueue({ type: "preview", focus: S.focus || null });
 }
 
 /** Item 3 (round 5): every rendered Shot back to "not rendered". */
@@ -1090,15 +1473,16 @@ async function clearAll() {
 
 /** Item 3: the preview from every rendered Shot, in order, with the Shots not
  *  rendered yet left out (hard cuts there). Every Shot loads its take. */
-function stitchPreview(focusId, force = false) {
-  if (S.busy || S.chunking || !P()) return;
+/** Update preview: the exact video of every rendered Shot (Shots not rendered
+ *  yet left out). Nothing is sampled. The run options, for the queue. */
+function previewOpts(focusId) {
   const act = active(), done = act.filter(isRendered);
-  if (done.length < (force ? 1 : 2)) return;
+  if (!done.length) return null;
   const gaps = act.filter((x) => !isRendered(x)).map((x) => x.id);
-  wholeQueue({ upto: done[done.length - 1].id, kind: "refresh", omit: gaps,
+  return { upto: done[done.length - 1].id, kind: "refresh", omit: gaps,
     label: "Updating the preview · rendered Shots back to back",
     note: gaps.length ? "Nothing is sampled · Shots not rendered yet are left out" : "Nothing is sampled",
-    onDone: onRendered(null, false, { gaps: gaps.length > 0, focus: focusId }) });
+    onDone: onRendered(null, false, { gaps: gaps.length > 0, focus: focusId }) };
 }
 
 /** Save PNG / Save audio-less MP4 are off: delete those side files of the render
@@ -1138,6 +1522,9 @@ function adoptRows(rows, sent, standalone = false) {
   }
 }
 
+/** The user has a Shot open that the run didn't touch (e.g. one added while it rendered). */
+const elsewhere = (chain) => !!S.open && !chain.includes(S.open) && P().shots.some((x) => x.id === S.open);
+
 function onRendered(targetId, standalone = false, opts = {}) {
   return ({ rows, text, outputs, built, sent }) => {
     const combine = built.nodes.combine ? outputs[built.nodes.combine] || {} : null;
@@ -1166,7 +1553,7 @@ function onRendered(targetId, standalone = false, opts = {}) {
       video_plan: video ? rows : prev.video_plan || null, video_chain: video ? built.chain : prev.video_chain || null };
     if (video) P().preview_dirty = false;
     S.dry = null;
-    if (targetId) S.open = targetId;
+    if (targetId && !elsewhere(built.chain)) S.open = targetId;
     const focus = targetId || opts.focus;
     if (focus) S.focus = focus;
     loadVideo(undefined, focus);
@@ -1189,60 +1576,48 @@ function previewStale() {
   return shown !== done.map((s) => s.kind === "clip" ? `${s.id}:clip` : `${s.id}:${s.take}`).join("|");
 }
 
-function refreshPreview() {
-  const done = active().filter(isRendered);
-  if (!done.length || S.busy || S.chunking) return;
-  wholeQueue({ upto: done[done.length - 1].id, kind: "refresh", label: "Updating the preview",
-    note: "Every Shot loads its take · nothing is sampled", onDone: onRendered(null) });
-}
+const refreshPreview = () => updatePreview();
 
 async function primary() {
   const rv0 = reviewShot(), nx0 = nextToRender();
+  if (nx0 && jobFor(nx0.id)) { toast(`${titleOf(nx0)} is already in the queue.`); return; }
   let alone = false;
   if (nx0 && nx0.standalone) {
     const mode = await askStandalone(nx0, "Render");
-    if (!mode || S.busy) return;
+    if (!mode) return;
     alone = mode === "alone";
   }
   const takes = nx0 ? await askMulti(titleOf(nx0)) : 1;
-  if (!takes || S.busy) return;
+  if (!takes) return;
   const rv = reviewShot(), nx = nextToRender();
   if (rv !== rv0 || nx !== nx0) return;        // something changed while the dialog was open
   if (rv) { rv.status = "approved"; rv.was_approved = false; }
   if (!nx) { scheduleSave(); render(); return; }
-  if (nx.standalone && alone) { multiGo(takes, [nx.id], () => renderAlone(nx)); return; }
-  const n = numOf(nx.id);
-  if (nx.standalone) {
-    multiGo(takes, [nx.id], () => queue({ upto: nx.id, kind: "render", trimLeft: true, label: `Rendering Shot ${n} · ${pinnedNote(nx)}`,
-      note: "In place · the Shots around it keep their takes", onDone: onRendered(nx.id) }));
-    return;
-  }
-  const others = active().filter((x) => x !== nx && isRendered(x)).length;
-  multiGo(takes, [nx.id], () => queue({ upto: nx.id, kind: "render", label: "Rendering Shot " + n,
-    note: others ? `${others} Shot${others > 1 ? "s" : ""} load${others > 1 ? "" : "s"} ${others > 1 ? "their" : "its"} take · only Shot ${n} renders`
-      : n > 1 ? `Shots 1–${n - 1} reused · only Shot ${n} renders` : "Rendering Shot 1",
-    onDone: onRendered(nx.id) }));
+  enqueue({ type: "shot", target: nx.id, kind: "render", mode: nx.standalone ? (alone ? "alone" : "pinned") : "chain" }, takes);
 }
 
 async function reroll() {
   const rv = reviewShot();
-  if (!rv || S.busy) return;
+  if (!rv || inRenderGuard(rv)) return;
   let alone = false;
   if (rv.standalone) {
     const mode = await askStandalone(rv, "Reroll");
-    if (!mode || S.busy || reviewShot() !== rv) return;
+    if (!mode || reviewShot() !== rv) return;
     alone = mode === "alone";
   }
   const takes = await askMulti(titleOf(rv));
-  if (!takes || S.busy || reviewShot() !== rv) return;
+  if (!takes || reviewShot() !== rv || inRenderGuard(rv)) return;
   rememberTake(rv);
   rv.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
   rv.status = "queued";
-  const n = numOf(rv.id), pinned = !alone && rv.standalone ? " · " + pinnedNote(rv) : "";
-  multiGo(takes, [rv.id], () => queue({ upto: rv.id, kind: "reroll", standalone: alone, trimLeft: !alone,
-    label: `Re-rolling Shot ${n}${alone ? " on its own" : pinned} · seed ${rv.shot_seed}`,
-    note: alone ? "A fresh start · no pins to the Shots around it" : "Every other Shot keeps its take",
-    onDone: onRendered(rv.id, alone) }));
+  enqueue({ type: "shot", target: rv.id, kind: "reroll", mode: alone ? "alone" : "pinned" }, takes);
+}
+
+/** A Shot that's part of the run going now can't be changed until it ends. */
+function inRenderGuard(s) {
+  if (!s || !inRender(s)) return false;
+  toast(`${titleOf(s)} is part of the render that's running. Queue it when that's done.`);
+  return true;
 }
 
 /** Shots the panel buttons would render: not rendered yet, generated, active. */
@@ -1253,47 +1628,31 @@ const oddToRender = () => toRender().filter((s) => numOf(s.id) % 2 === 1);
  *  from the Shot before it (the standard workflow). Rendered Shots keep their
  *  takes, so gaps between them render as bridges. All land under review. */
 async function renderAll() {
-  if (busyGuard()) return;
-  const list = toRender();
-  if (!list.length) { toast("Every Shot is rendered."); return; }
+  const list = toRender().filter((x) => !jobFor(x.id));
+  if (!list.length) { toast(toRender().length ? "Those Shots are already in the queue." : "Every Shot is rendered."); return; }
   const takes = await askMulti(`Render all (${list.length} Shot${list.length > 1 ? "s" : ""})`);
-  if (!takes || S.busy) return;
-  const lastOne = list[list.length - 1];
-  const others = active().filter((x) => isRendered(x) && !list.includes(x)).length;
-  multiGo(takes, list.map((x) => x.id), () => queue({ upto: lastOne.id, kind: "render", label: `Rendering all · ${list.length} Shot${list.length > 1 ? "s" : ""}`,
-    note: others ? `${others} rendered Shot${others > 1 ? "s keep their takes" : " keeps its take"} · each new Shot continues from the one before`
-      : "Each Shot continues from the one before",
-    onDone: (args) => {
-      onRendered(lastOne.id)(args);
-      // review from the first Shot that rendered
-      S.focus = list[0].id;
-      S.open = list[0].id;
-      loadVideo(undefined, list[0].id);
-    } }));
+  if (!takes) return;
+  enqueue({ type: "all", ids: list.map((x) => x.id) }, takes);
 }
 
 /** ▶ Render odd Shots: Shots 1, 3, 5… not rendered yet, each on its own, one
  *  render after another. Then Render all (or the main button) bridges the gaps. */
 async function renderOdd() {
-  if (busyGuard()) return;
-  const list = oddToRender();
-  if (!list.length) { toast("Every odd Shot is rendered."); return; }
+  const list = oddToRender().filter((x) => !jobFor(x.id));
+  if (!list.length) { toast(oddToRender().length ? "Those Shots are already in the queue." : "Every odd Shot is rendered."); return; }
   const takes = await askMulti(`Render odd Shots (${list.length} Shot${list.length > 1 ? "s" : ""})`);
-  if (!takes || S.busy) return;
-  const ids = list.map((x) => x.id);
-  multiGo(takes, ids, () => {
-    // each pass: the same odd Shots, one after another
-    const now = ids.map((id) => P().shots.find((x) => x.id === id)).filter((x) => x && !x.bypassed && x.status === "queued");
-    return now.length ? renderAlone(now[0], { ids: now.slice(1).map((x) => x.id), of: now.length }) : null;
-  });
+  if (!takes) return;
+  // one job per Shot, each on its own; with Multi-take, pass after pass
+  enqueue(list.map((x) => ({ type: "shot", target: x.id, kind: "render", mode: "alone" })), takes);
 }
 
 /** ▶ on a Shot card: render it on its own (Multi-take asks first). */
 async function renderAloneAction(s) {
-  if (!s || s.kind === "clip" || s.bypassed || busyGuard()) return;
+  if (!s || s.kind === "clip" || s.bypassed || inRenderGuard(s)) return;
+  if (jobFor(s.id)) { toast(`${titleOf(s)} is already in the queue.`); return; }
   const takes = await askMulti(titleOf(s));
-  if (!takes || S.busy) return;
-  multiGo(takes, [s.id], () => renderAlone(s));
+  if (!takes) return;
+  enqueue({ type: "shot", target: s.id, kind: "render", mode: "alone" }, takes);
 }
 
 /** Item 4 (round 5): a standalone Shot re-rendering next to rendered Shots —
@@ -1324,7 +1683,7 @@ function pinnedNote(s) {
 /** Item 1 (round 5): back to "not rendered", keeping prompt, seconds and seed.
  *  The take stays on disk, in Take history. */
 function clearRender(s) {
-  if (!s || s.kind === "clip" || busyGuard() || s.status === "queued") return;
+  if (!s || s.kind === "clip" || listGuard(P().shots.indexOf(s), 1) || s.status === "queued") return;
   clearFields(s);
   S.gen++;
   S.dry = null;
@@ -1334,22 +1693,11 @@ function clearRender(s) {
     "(the same picture unless something around it changed; Reroll for a new one). Its old take stays in Take history.");
 }
 
-/** Item 12: render one Shot on its own — a fresh generation from the
- *  references, not continued from the Shot before and not pinned to the one
- *  after. Its neighbours render later as bridges pinned to it. */
-function renderAlone(s, batch = null) {
-  if (!s || s.kind === "clip" || s.bypassed || S.busy) return;
-  const n = numOf(s.id);
-  const step = batch ? ` · ${batch.of - batch.ids.length} of ${batch.of}` : "";
-  return queue({ upto: s.id, kind: "render", standalone: true, batch, label: `Rendering Shot ${n} on its own${step}`,
-    note: "A fresh start from the references · no pins to the Shots around it",
-    onDone: onRendered(s.id, true) });
-}
-
 function dryRun() {
   const shots = active();
-  if (!shots.length || S.busy) return;
-  queue({ upto: shots[shots.length - 1].id, dry: true, kind: "dry", label: "Dry run · planning every shot",
+  if (!shots.length) return;
+  if (S.busy || S.chunking) { toast("The dry run starts when ComfyUI is free (a render is running)."); return; }
+  runNow({ upto: shots[shots.length - 1].id, dry: true, kind: "dry", label: "Dry run · planning every shot",
     note: "Nothing is sampled", onDone: ({ rows, text, built }) => {
       S.dry = { rows, text, chain: built.chain };
       showModal("Dry run · full prompts", text);
@@ -1358,7 +1706,7 @@ function dryRun() {
 
 async function stop() {
   const b = S.busy;
-  if (!b) return;
+  if (!b) { if (S.chunking) S.chunking.stopRequested = true; return; }   // between two chunks
   b.stopped = true;
   try { await api("/interrupt", { method: "POST", body: { prompt_id: b.promptId } }); } catch (e) { /* older ComfyUI */ }
   try { await api("/queue", { method: "POST", body: { delete: [b.promptId] } }); } catch (e) { /* not queued */ }
@@ -1380,9 +1728,10 @@ function connect() {
     renderHeader(); renderDecision();
     if (P()) renderShots();                     // ▶ on Shot cards follows the connection
     pollStats();
-    if (S.busy) pollLater(); else autoCheck();
+    if (S.busy) pollLater(); else { queueNext(); autoCheck(); }
+    renderQueue();
   };
-  ws.onclose = () => { S.conn = S.restarting ? "restarting" : "down"; renderHeader(); renderDecision(); if (P()) renderShots(); retry(); };
+  ws.onclose = () => { S.conn = S.restarting ? "restarting" : "down"; renderHeader(); renderDecision(); renderQueue(); if (P()) renderShots(); retry(); };
   ws.onerror = () => {};
   ws.onmessage = (ev) => {
     if (typeof ev.data !== "string") return;          // binary previews
@@ -1412,6 +1761,7 @@ function onMessage(type, d) {
     default: return;
   }
   renderDecision();
+  renderQueue();
 }
 
 function onSegment(b, d) {
@@ -1419,7 +1769,7 @@ function onSegment(b, d) {
   b.segs[d.segment] = d.status;
   if (d.status === "reused") (b.sources = b.sources || {})[d.segment] = d.source || "memory";
   if (d.status === "rendering") { b.segT0[d.segment] = Date.now(); b.step = 0; b.current = d; }
-  if (d.status === "done" && b.segT0[d.segment] && d.seconds) {
+  if (d.status === "done" && b.segT0[d.segment] && d.seconds && b.slug === P().slug) {
     const rate = (Date.now() - b.segT0[d.segment]) / 1000 / d.seconds;   // wall s per video s
     const st = P().stats;
     st.rate = st.rate ? st.rate * 0.6 + rate * 0.4 : rate;
@@ -1534,7 +1884,7 @@ async function makeClips(takes) {
   const list = takes.filter((t) => t && t.take && !S.clips[takeStem(t.take)]).slice(0, 24);
   if (!list.length || S.busy || S.queuing || !S.clipsReady) return;
   list.forEach((t) => S.clipTried.add(t.take));
-  await queue({ kind: "clips", takeClips: list.map((t) => ({ key: takeStem(t.take), take: t.take })),
+  await runNow({ kind: "clips", takeClips: list.map((t) => ({ key: takeStem(t.take), take: t.take })),
     label: `Making clip${list.length > 1 ? "s" : ""} · ${list.length} take${list.length > 1 ? "s" : ""}`,
     note: "Each take decoded on its own · nothing is sampled", onDone: () => {} });
   // it didn't start (ComfyUI busy, another job first…): try again later
@@ -1542,11 +1892,21 @@ async function makeClips(takes) {
 }
 
 /** The takes the timeline shows always get a clip (older takes, take switches). */
-function ensureClips() {
-  if (!P() || S.busy || S.queuing || S.chunking || S.conn !== "ok" || !S.clipsReady) return;
-  const need = active().filter((s) => s.kind !== "clip" && isRendered(s) && s.take &&
-    !S.clips[takeStem(s.take)] && !S.clipTried.has(s.take)).map((s) => ({ take: s.take }));
-  if (need.length) makeClips(need);
+/** Clips are never made on their own (opening a project, after a render): the
+ *  timeline offers "Make N missing clips" instead. Kept as a no-op for callers. */
+function ensureClips() {}
+
+/** The takes the timeline shows that have no clip (deleted, or made before 0.6.5). */
+function missingClips() {
+  if (!P() || !S.clipsReady) return [];
+  return active().filter((s) => s.kind !== "clip" && isRendered(s) && s.take && !S.clips[takeStem(s.take)])
+    .map((s) => ({ take: s.take }));
+}
+
+function makeMissingClips(list) {
+  if (S.busy || S.chunking || S.queuing) { toast("ComfyUI is busy. Make the clips when the queue is done."); return; }
+  list.forEach((t) => S.clipTried.delete(t.take));
+  makeClips(list);
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,16 +1937,12 @@ function exportedToast(r, skipped) {
 }
 
 async function exportApproved() {
-  if (!P() || busyGuard()) return;
+  if (!P()) return;
   const items = approvedForExport();
   if (!items.length) { toast("No approved Shots to export yet."); return; }
   const skipped = active().filter((s) => s.kind !== "clip" && s.status !== "approved").length;
   if (P().settings.export_upscale) {
-    const v = P().settings.rtx_vsr || {};
-    queue({ kind: "export", exportClips: items.map((x) => ({ take: x.take })),
-      label: `Exporting ${items.length} approved clip${items.length === 1 ? "" : "s"} · upscaled ${v.scale || 2}× ${v.quality || "ULTRA"}`,
-      note: "Each approved take decoded on its own, whole, and upscaled a frame at a time",
-      extra: { items: items.map((x) => ({ name: x.name })), skipped }, onDone: () => {} });
+    enqueue({ type: "export" });
     return;
   }
   const missing = items.filter((x) => !S.clips[x.key]);
@@ -1704,7 +2060,8 @@ function showEntry(e) {
   $("placeholder").hidden = !!(e && e.src);
   const sh = e && shotById(e.id);
   $("ph-shot").textContent = !any || !sh ? "Nothing rendered yet"
-    : e.noclip ? `${titleOf(sh)} · making this take's clip…` : `${titleOf(sh)} · not rendered yet`;
+    : e.noclip ? (S.busy && S.busy.kind === "clips" ? `${titleOf(sh)} · making this take's clip…`
+      : `${titleOf(sh)} · no clip yet: "Make missing clips" under the timeline`) : `${titleOf(sh)} · not rendered yet`;
 }
 
 function safePlay() {
@@ -1970,6 +2327,7 @@ function render() {
   renderSettings();
   renderAdvanced();
   renderPlan();
+  renderQueue();
 }
 
 function renderSaveState() { $("save-state").textContent = S.saveState; }
@@ -2145,7 +2503,7 @@ function joinMark(prev, s) {
 }
 
 /** A Shot in the render that's running can't be edited until it finishes. */
-const inRender = (s) => !!S.busy && S.busy.kind !== "dry" && S.busy.kind !== "check" &&
+const inRender = (s) => busyHere() && !!S.busy && S.busy.kind !== "dry" && S.busy.kind !== "check" &&
   !!S.busy.built && S.busy.built.chain.includes(s.id);
 
 /** The always-visible row of a (generated) Shot card: status, title, preview, tools. */
@@ -2171,7 +2529,7 @@ function shotRowHTML(s) {
     ? '<span class="flag standalone" title="Rendered on its own, from the references. The Shot before it bridges into it.">standalone</span>' : "";
   const bridge = cut ? `<button class="ghost sm bridge" data-action="bridge" title="Re-render ${title} in place so it flows from the Shot before it${s.standalone ? " (it stops being standalone)" : ""}; the Shots after it stay">Bridge</button>` : "";
   const canAlone = state === "queued" && s.kind !== "clip";
-  const aloneOff = !!S.busy || S.conn !== "ok" || missingRefs().length > 0;
+  const aloneOff = S.conn !== "ok" || missingRefs().length > 0;
   const play = canAlone ? `<button class="sdot sdot-play" data-action="render-alone"${aloneOff ? " disabled" : ""}
       title="Render this Shot on its own — a fresh start, not continued from the Shot before." aria-label="Render ${title} on its own">▶</button>` : "";
   return `${play}<button class="shot-head${play ? " has-play" : ""}" data-action="toggle-shot" aria-expanded="${open}">
@@ -2199,9 +2557,122 @@ function refreshShotRow(s) {
   el.classList.toggle("review", !s.bypassed && s.status === "review");
 }
 
+// ---------------------------------------------------------------------------
+// Frame anchors: an image at a join (before Shot 1, between two Shots, after
+// the last). It's the last frame of the Shot before and the first frame of the
+// Shot after; each of them gets it as its next <Picture N>, after the Cast.
+// Kept on the Shot after the join (anchor_in), or the project (anchor_end).
+// ---------------------------------------------------------------------------
+
+/** Joins that can take an anchor: before each generated Shot whose neighbour
+ *  before it isn't a clip, and after the last Shot when it's generated. */
+function anchorKeys() {
+  const act = active(), out = [];
+  act.forEach((s, i) => { if (s.kind !== "clip" && !(act[i - 1] && act[i - 1].kind === "clip")) out.push(s.id); });
+  if (act.length && act[act.length - 1].kind !== "clip") out.push("end");
+  return out;
+}
+function anchorItem(key) {
+  const a = key === "end" ? P().anchor_end : (P().shots.find((x) => x.id === key) || {}).anchor_in;
+  return a && a.file ? a : null;
+}
+/** The Shots on either side of a join: [before, after] (either may be null). */
+function anchorSides(key) {
+  const act = active();
+  if (key === "end") return [act[act.length - 1] || null, null];
+  const i = act.findIndex((x) => x.id === key);
+  return [i > 0 ? act[i - 1] : null, i >= 0 ? act[i] : null];
+}
+function anchorTitle(key) {
+  const [a, b] = anchorSides(key);
+  return !a ? `First frame of ${titleOf(b)}` : !b ? `Last frame of ${titleOf(a)}` : `Frame between ${titleOf(a)} and ${titleOf(b)}`;
+}
+/** <Picture N> of an anchor for the Shot before it (its end) and after it (its start). */
+function anchorPictures(key) {
+  const k = liveCast().length;
+  const [a, b] = anchorSides(key);
+  const out = [];
+  if (a) out.push(`${titleOf(a)}: <Picture ${k + 1 + (a.anchor_in && a.anchor_in.file && anchorKeys().includes(a.id) ? 1 : 0)}> (its end)`);
+  if (b) out.push(`${titleOf(b)}: <Picture ${k + 1}> (its start)`);
+  return out.join(" · ");
+}
+
+/** A tile in the Anchors column, straddling the join it belongs to ("top" of
+ *  the card after it, or "bottom" of the last card for the end anchor). */
+function anchorSlot(key, edge = "top") {
+  const it = anchorItem(key);
+  const miss = it && ["missing", "invalid"].includes(S.refState["anchor:" + key]);
+  const thumb = it && !miss ? `<img class="anchor-thumb" alt="" draggable="false" src="${esc(viewURL({ filename: it.file, subfolder: it.subfolder || "", type: "input" }))}">` : "";
+  const tip = anchorTitle(key) + (it ? `\n${miss ? "Missing: " : ""}${it.file}\n${anchorPictures(key).split(" · ").join("\n")}`
+    : "\nFrame anchor (optional): click to upload, or drop an image here");
+  return `<div class="anchor-slot ${edge}${it ? " set" : ""}${miss ? " missing" : ""}" data-anchor="${esc(key)}" title="${esc(tip)}">
+    ${thumb ? `<button class="anchor-face" data-action="anchor-pick" aria-label="${esc(anchorTitle(key))}: upload a new image">${thumb}</button>`
+      : `<button class="anchor-face anchor-add" data-action="anchor-pick" aria-label="${esc(anchorTitle(key))}: upload an image">${miss ? "!" : PLUS}</button>`}
+    <span class="anchor-tools">
+      <span class="anchor-swap" title="Choose a file from the input folder">⇄<select class="anchor-sel" data-anchor-file aria-label="${esc(anchorTitle(key))}: choose a file">${inputOptions("images", it ? it.subfolder : "", it ? it.file : "", it ? "None" : "Choose a file…")}</select></span>
+      ${it ? `<button class="anchor-x" data-action="anchor-clear" title="Remove this frame anchor" aria-label="Remove this frame anchor">${CROSS}</button>` : ""}
+    </span>
+  </div>`;
+}
+
+/** An anchor changed: the Shots touching it render again, or keep their takes. */
+async function anchorChanged(key) {
+  const touched = anchorSides(key).filter((x) => x && x.kind !== "clip" && x.status !== "queued");
+  S.dry = null;
+  if (touched.length) {
+    const names = touched.map(titleOf).join(" and ");
+    const ans = await confirmBox({ title: "Frame anchor changed",
+      body: `${names} ${touched.length > 1 ? "are" : "is"} rendered. Re-render ${touched.length > 1 ? "them" : "it"} so ${touched.length > 1 ? "they" : "it"} ` +
+        "land on the new frame, or keep the takes (the frame applies the next time they render).",
+      yes: `Re-render ${names}`, alt: "Keep the takes", no: "Keep the takes" });
+    if (ans === true) {
+      S.gen++;
+      for (const x of touched) {
+        if (x.status === "approved") x.was_approved = true; else x.was_rendered = true;
+        x.status = "queued";
+      }
+    }
+  }
+  commit();
+  checkInputs().then(render);
+}
+
+function setAnchor(key, info) {
+  const p = P();
+  const val = info ? { file: info.name || info.file, subfolder: info.subfolder || "", sha256: info.sha256 || null } : null;
+  if (key === "end") p.anchor_end = val;
+  else { const sh = p.shots.find((x) => x.id === key); if (!sh) return; sh.anchor_in = val; }
+  if (val) S.refState["anchor:" + key] = "ok";
+  anchorChanged(key);
+}
+
+async function anchorUpload(key, fileList) {
+  const f = [...fileList].find(isImageFile);
+  if (!f) { toast("A frame anchor is an image (PNG, JPG, WebP…)."); return; }
+  if (busyGuard()) return;
+  try { setAnchor(key, await uploadImage(f)); await loadInputs(); render(); }
+  catch (e) { toast("Upload failed: " + e.message); }
+}
+
+function anchorPick(key) {
+  if (busyGuard()) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "image/*";
+  inp.addEventListener("change", () => { if (inp.files.length) anchorUpload(key, inp.files); });
+  inp.click();
+}
+
 function renderShots() {
   if (deferIfHeld("shots")) return;
   let prevActive = null;
+  const slots = new Set(anchorKeys());
+  const lastId = active().length ? active()[active().length - 1].id : null;
+  /** The Anchors column tiles that sit on this card's edges. */
+  const tiles = (s) => s.bypassed ? "" : (slots.has(s.id) ? anchorSlot(s.id, "top") : "") +
+    (s.id === lastId && slots.has("end") ? anchorSlot("end", "bottom") : "");
+  $("shots-panel").classList.toggle("has-anchors", slots.size > 0);
+  $("shots-panel").classList.toggle("anchor-end", slots.has("end"));
   $("shots").innerHTML = P().shots.map((s) => {
     let mark = "";
     if (!s.bypassed) {
@@ -2236,17 +2707,17 @@ function renderShots() {
           <button class="ghost sm" data-action="replace-clip" title="Put a video clip in this Shot's place (the Shot is kept, bypassed)">Replace with clip</button>
         </div>
         </div>` : "";
-    return mark + `<div class="shot${state === "review" ? " review" : ""}${s.bypassed ? " off" : ""}" data-shot="${esc(s.id)}">
+    return mark + `<div class="shot${state === "review" ? " review" : ""}${s.bypassed ? " off" : ""}" data-shot="${esc(s.id)}">${tiles(s)}
       <div class="shot-row">${shotRowHTML(s)}</div>${body}</div>`;
   }).join("");
   $("add-shot").innerHTML = `${PLUS} Add Shot ${active().length + 1}`;
-  const off = !!S.busy || S.conn !== "ok" || missingRefs().length > 0;
-  const nAll = toRender().length, nOdd = oddToRender().length;
+  const off = S.conn !== "ok" || missingRefs().length > 0;
+  const nAll = toRender().filter((x) => !jobFor(x.id)).length, nOdd = oddToRender().filter((x) => !jobFor(x.id)).length;
   $("render-all").textContent = `▶ Render all${nAll ? ` (${nAll})` : ""}`;
   $("render-all").disabled = off || !nAll;
   $("render-odd").textContent = `▶ Render odd Shots${nOdd ? ` (${nOdd})` : ""}`;
   $("render-odd").disabled = off || !nOdd;
-  $("clear-all").disabled = !!S.busy || !active().some((s) => s.kind !== "clip" && s.status !== "queued");
+  $("clear-all").disabled = busyHere() || !active().some((s) => s.kind !== "clip" && s.status !== "queued");
   const first = $("add-first");
   first.hidden = !P().shots.length;
   first.innerHTML = `${PLUS} Add shot before Shot 1`;
@@ -2292,10 +2763,10 @@ function renderViewer() {
   scrub.disabled = !TL.entries.length || !has;
   $("ticks").innerHTML = "";
   // the timeline: one block per Shot, its thumbnail, ◀ take ▶ under it
-  const off = !!S.busy;
   $("tl-strip").innerHTML = total ? TL.entries.map((e) => {
     const sh = shotById(e.id);
     if (!sh) return "";
+    const off = takesLocked(sh);
     const st = sh.kind === "clip" ? "clip" : sh.status;
     const list = sh.kind !== "clip" && sh.take ? S.takes[sh.id] : null;
     const i = list ? list.findIndex((t) => t.name === sh.take) : -1;
@@ -2312,10 +2783,16 @@ function renderViewer() {
   }).join("") : "";
   const approx = !TL.exact && TL.entries.some((e) => e.rendered);
   $("tl-approx").hidden = !approx;
+  const off = busyHere();
   $("tl-update").disabled = off || S.conn !== "ok";
-  const older = takesWithoutClips().length;
-  $("tl-make").hidden = !older;
-  $("tl-make").textContent = `Make clips for ${older} older take${older === 1 ? "" : "s"}`;
+  const miss = missingClips().length, older = takesWithoutClips().length;
+  $("tl-make").hidden = !miss && !older;
+  $("tl-make").textContent = miss ? `Make ${miss} missing clip${miss === 1 ? "" : "s"}`
+    : `Make clips for ${older} older take${older === 1 ? "" : "s"}`;
+  $("tl-make").title = miss ? "Shots on the timeline whose take has no clip (deleted, or made before 0.6.5): decode each take on its own. Nothing is sampled."
+    : "Takes in Take history that have no clip yet: decode each on its own (nothing is sampled).";
+  $("tl-approx-main").hidden = !approx;
+  $("tl-approx").hidden = !approx && $("tl-make").hidden;
   $("tl-make").disabled = off || S.conn !== "ok";
   const nApproved = active().filter((s) => s.kind !== "clip" && s.status === "approved" && s.take).length;
   $("tl-export").hidden = !nApproved;
@@ -2354,7 +2831,7 @@ function renderDecision() {
   if (deferIfHeld("decision")) return;
   const errBox = S.error ? `<div class="err" role="alert"><span>${esc(S.error)}</span>
       <button class="icon x" data-action="dismiss-error" aria-label="Dismiss">${CROSS}</button></div>` : "";
-  const b = S.busy;
+  const b = busyHere() ? S.busy : null;
   if (b) {
     const pct = progressOf(b);
     const label = b.phase === "queued" ? b.label + " · waiting in ComfyUI's queue"
@@ -2417,15 +2894,22 @@ function renderDecision() {
   else if (stale) { mainLabel = "▶ Update preview"; mainAction = "primary"; }
   else if (allDone && vsrOk) { mainLabel = `⤢ Upscale final video (${v.scale}× ${v.quality})${fin ? " again" : ""}`; mainAction = "final"; }
   else { mainLabel = "All done"; mainAction = "primary"; mainOff = true; }
-  const off = S.conn !== "ok" || missing.length > 0;
-  if (S.conn !== "ok") line = "ComfyUI isn't connected. Rendering waits until it's back.";
+  const off = missing.length > 0;
+  const nxJob = nx && jobFor(nx.id), rvJob = rv && jobFor(rv.id);
+  if (nxJob && mainAction === "primary") {
+    if (!rv) line = `${titleOf(nx)} is in the queue (${nxJob.state === "running" ? "rendering" : "#" + jobPos(nxJob)}).`;
+    if (mainAction === "primary" && nx) mainOff = true;
+  }
+  if (rvJob) line = `${titleOf(rv)} has more takes in the queue (${rvJob.state === "running" ? "rendering" : "#" + jobPos(rvJob)}). Review them when they're done.`;
+  if (mainAction === "final" && Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "final")) mainOff = true;
+  if (S.conn !== "ok") line = "ComfyUI isn't connected. Renders you start wait in the queue until it's back.";
   const sub = [rv ? takeNav(rv) : "",
     thr ? `<button class="ghost sm through" data-action="render-through"${off ? " disabled" : ""}>⟳ Re-render through ${esc(titleOf(thr))}</button>` : ""].filter(Boolean).join("");
   el.innerHTML = `${errBox}<div class="dec-line">${esc(line)}</div>
     <div class="dec-row3">
       <button class="ghost approve" data-action="approve" title="Approve ${esc(titleOf(rv))} without rendering anything"${!rv || off ? " disabled" : ""}>✓ Approve</button>
       <button class="primary go" data-action="${mainAction}"${mainOff || off ? " disabled" : ""}>${esc(mainLabel)}</button>
-      <button class="ghost" data-action="reroll" title="Reroll ${esc(titleOf(rv))}"${!rv || off ? " disabled" : ""}>⟳ Reroll</button>
+      <button class="ghost" data-action="reroll" title="Reroll ${esc(titleOf(rv))}"${!rv || off || rvJob ? " disabled" : ""}>⟳ Reroll</button>
     </div>${sub ? `<div class="dec-sub">${sub}</div>` : ""}`;
   layoutStage();
 }
@@ -2730,7 +3214,9 @@ function pinText(r) {
 function renderPlan() {
   const rid = renderingId();
   const act = active();
-  if (!act.length) { $("plan").innerHTML = '<div class="plan-empty">No active shots.</div>'; return; }
+  if (!act.length) { $("plan").innerHTML = '<div class="plan-empty peek">No active shots.</div>'; return; }
+  // folded, the Plan shows one line: the Shot rendering, else the next to render, else the last
+  const peekId = (act.find((x) => x.id === rid) || act.find((x) => x.kind !== "clip" && x.status === "queued") || act[act.length - 1]).id;
   const dryRow = (id) => {
     if (!S.dry) return null;
     const i = S.dry.chain.indexOf(id);
@@ -2745,7 +3231,7 @@ function renderPlan() {
       const r = dry || row;
       len = (r ? r.seconds : s.clip.frames / 24).toFixed(2) + "s";
       status = `clip · ${s.clip.original_name || s.clip.file || "no video"}${r && r.seam === "mismatch" ? " · not bridged yet" : ""}${r && r.join === "cut" ? " · cut" : ""}`;
-      return `<div class="plan-row"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:#8FD3F0">${esc(status)}</span></div>`;
+      return `<div class="plan-row${s.id === peekId ? " peek" : ""}"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:#8FD3F0">${esc(status)}</span></div>`;
     }
     if (s.id === rid) { len = (row ? row.seconds.toFixed(2) : s.seconds) + "s"; status = "rendering…"; color = "#E9E7E2"; }
     else if (s.status === "approved" && (row || dry)) {
@@ -2774,7 +3260,7 @@ function renderPlan() {
     if (s.standalone && s.status !== "queued") status += " · standalone";
     if (cutBefore(s) && !/hard cut/.test(status)) status += " · cut before it";
     if (((dry || row) && (dry || row).seam === "mismatch") || cutBefore(s)) color = "#FFB4A8";
-    return `<div class="plan-row"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:${color}">${esc(status)}</span></div>`;
+    return `<div class="plan-row${s.id === peekId ? " peek" : ""}"><span>Seg ${k + 1}</span><span class="muted">${esc(len)}</span><span style="color:${color}">${esc(status)}</span></div>`;
   }).join("");
 }
 
@@ -2786,16 +3272,18 @@ function castOf(el) { const c = el.closest("[data-cast]"); return c && P().cast.
 function shotOf(el) { const c = el.closest("[data-shot]"); return c && P().shots.find((x) => x.id === c.dataset.shot); }
 
 document.addEventListener("click", async (e) => {
+  if (S.swapped) return;                     // a moment while a queue job saves into its project
   const el = e.target.closest("[data-action]");
   if (!el || el.disabled) return;
   const a = el.dataset.action;
   const p = P();
   switch (a) {
     case "primary": primary(); break;
-    case "approve": { const rv = reviewShot(); if (rv && !busyGuard()) { rv.status = "approved"; rv.was_approved = false; commit(); } break; }
+    case "fold": toggleFold(el.dataset.fold); break;
+    case "approve": { const rv = reviewShot(); if (rv && !shotGuard(rv)) { rv.status = "approved"; rv.was_approved = false; commit(); } break; }
     case "approve-next": {
       const rv = reviewShot();
-      if (!rv || busyGuard()) break;
+      if (!rv || shotGuard(rv)) break;
       rv.status = "approved"; rv.was_approved = false;
       const nextRv = reviewShot();
       const wasPlaying = PL.playing;
@@ -2824,8 +3312,8 @@ document.addEventListener("click", async (e) => {
     case "toggle": S[el.dataset.key] = !S[el.dataset.key]; render(); break;
     case "toggle-shot": { const s = shotOf(el); S.open = S.open === s.id ? null : s.id; renderShots(); break; }
     case "bypass-shot": {
-      if (S.busy) return toast("Wait for the render to finish (or Stop it) first.");
       const s = shotOf(el);
+      if (listGuard(p.shots.indexOf(s))) return;
       s.bypassed = !s.bypassed;
       S.dry = null;
       if (!syncAfter(s, `${s.bypassed ? "Bypassing" : "Turning on"} a Shot`) && renderedAfter(s).length && s.take) {
@@ -2835,8 +3323,8 @@ document.addEventListener("click", async (e) => {
       break;
     }
     case "remove-shot": {
-      if (S.busy) return toast("Wait for the render to finish (or Stop it) first.");
       const s = shotOf(el);
+      if (listGuard(p.shots.indexOf(s))) return;
       if (s.text && !confirm(`Remove ${s.bypassed ? "this bypassed shot" : titleOf(s)}? Its text is deleted.`)) return;
       if (!s.bypassed) syncAfter(s, "Removing a Shot");
       S.dry = null;
@@ -2981,10 +3469,14 @@ document.addEventListener("click", async (e) => {
     case "tl-pick": { const b = el.closest("[data-tl]"); if (b) focusShot(b.dataset.tl); break; }
     case "tl-take": { const b = el.closest("[data-tl]"); const sh = b && shotById(b.dataset.tl); if (sh) { S.focus = sh.id; stepTake(sh, +el.dataset.dir); } break; }
     case "update-preview": updatePreview(); break;
-    case "make-clips": makeClips(takesWithoutClips()); break;
+    case "make-clips": makeMissingClips(missingClips().length ? missingClips() : takesWithoutClips()); break;
     case "clear-all": clearAll(); break;
     case "open-folder": openFolder(el.dataset.which); break;
     case "export-approved": exportApproved(); break;
+    case "queue-pause": case "queue-clear": case "queue-open": case "queue-stop": case "queue-retry":
+    case "queue-remove": case "queue-up": case "queue-down": queueAction(a, el); break;
+    case "anchor-pick": { const k = el.closest("[data-anchor]"); if (k) anchorPick(k.dataset.anchor); break; }
+    case "anchor-clear": { const k = el.closest("[data-anchor]"); if (k && !busyGuard()) setAnchor(k.dataset.anchor, null); break; }
     case "menu": toggleMenu(); break;
     case "new-project": closeMenu(); newProject(); break;
     case "open-list": closeMenu(); openList(); break;
@@ -3007,8 +3499,42 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+/** Where the part of the Shots list that's rendering ends: the index of its
+ *  last Shot, -1 when the open project isn't rendering, Infinity when the run
+ *  has no Shot chain (then the whole list waits). */
+function runEnd() {
+  if (!busyHere()) return -1;
+  const ch = S.busy && S.busy.built && S.busy.built.chain;
+  if (!ch || S.chunking) return Infinity;
+  const shots = P().shots;
+  return Math.max(-1, ...ch.map((id) => shots.findIndex((x) => x.id === id)));
+}
+/** Changes to the list itself (add, insert, remove, bypass, clips) are fine
+ *  after the Shots that are rendering; inside them they wait. `at` is the
+ *  index the change happens at; `gap` asks for one free Shot in between. */
+function listGuard(at, gap = 0) {
+  if (S.applying && S.swapped) { toast("One moment: saving a render from the queue…"); return true; }
+  const end = runEnd();
+  if (end < 0 || at > end + gap) return false;
+  toast(end === Infinity ? "Wait for the render to finish (or Stop it) first."
+    : "That part of the Shots list is rendering. Add, remove or change Shots after it, or wait for the render to finish.");
+  return true;
+}
+/** A Shot that isn't part of the render going now can be reviewed and changed. */
+function shotGuard(s) {
+  if (S.applying && S.swapped) { toast("One moment: saving a render from the queue…"); return true; }
+  if (!busyHere()) return false;
+  const end = runEnd();
+  if (end !== Infinity && s && !inRender(s)) return false;
+  return busyGuard();
+}
+
+/** A Shot's take can't switch while it (or the Shot just before it) is rendering. */
+const takesLocked = (s) => busyHere() && runEnd() >= P().shots.indexOf(s) - 1;
+
 function busyGuard() {
-  if (!S.busy && !S.chunking) return false;
+  if (S.applying && S.swapped) { toast("One moment: saving a render from the queue…"); return true; }
+  if (!busyHere()) return false;
   toast("Wait for the render to finish (or Stop it) first.");
   return true;
 }
@@ -3018,6 +3544,7 @@ function commit() { render(); scheduleSave(); }
 /** Text fields: typing updates the project quietly; leaving the field commits
  *  (and applies the re-render rules). */
 document.addEventListener("input", (e) => {
+  if (S.swapped) { swapEvents.push(["input", e.target]); return; }   // replayed when it's back
   const el = e.target;
   const p = P();
   if (!p) return;
@@ -3041,6 +3568,7 @@ const committed = new WeakMap();      // element -> value when focused, to see r
 document.addEventListener("focusin", (e) => { committed.set(e.target, e.target.value); });
 
 document.addEventListener("change", async (e) => {
+  if (S.swapped) { swapEvents.push(["change", e.target]); return; }
   const el = e.target;
   const p = P();
   if (!p) return;
@@ -3049,6 +3577,13 @@ document.addEventListener("change", async (e) => {
   committed.set(el, el.value);
   if (el.dataset.relink) { relinkFromSelect(el); return; }
   if (el.id === "tl-export-up") { p.settings.export_upscale = el.checked; return commit(); }
+  if (el.dataset.anchorFile !== undefined) {
+    const k = el.closest("[data-anchor]");
+    if (!k || busyGuard()) { render(); return; }
+    const [sub, name] = el.value ? el.value.split("|") : ["", ""];
+    setAnchor(k.dataset.anchor, name ? { name, subfolder: sub } : null);
+    return;
+  }
   if (el.dataset.baseSeed !== undefined) { changeBaseSeed(el); return; }
   if (el.dataset.multi !== undefined) {   // takes per render: nothing re-renders
     p.settings.multi_take = Math.max(1, Math.min(MULTI_MAX, Math.round(Number(el.value)) || 1));
@@ -3067,7 +3602,7 @@ document.addEventListener("change", async (e) => {
     } else p.settings.rtx_vsr[k] = k === "scale" ? Number(el.value) : el.value;
     return commit();
   }
-  if (S.busy && !el.dataset.shotField) {
+  if (busyHere() && !el.dataset.shotField) {
     toast("Wait for the render to finish (or Stop it) first.");
     render();
     return;
@@ -3093,7 +3628,7 @@ document.addEventListener("change", async (e) => {
   }
   if (el.dataset.shotField) {
     const s = shotOf(el);
-    if (S.busy && S.busy.kind !== "dry" && S.busy.built.chain.includes(s.id)) {
+    if (inRender(s)) {
       toast("This shot is part of the render in progress; edit it when it finishes.");
       return render();
     }
@@ -3256,6 +3791,7 @@ function wrap(btn) {
 }
 
 document.addEventListener("keydown", (e) => {
+  if (S.swapped) return;
   if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "s") {
     e.preventDefault();
     saveNow();
@@ -3291,7 +3827,7 @@ $("modal").addEventListener("click", (e) => { if (e.target === $("modal")) $("mo
 // ---------------------------------------------------------------------------
 
 async function switchProject(slug) {
-  if (busyGuard()) return;
+  while (S.applying) await new Promise((r) => setTimeout(r, 100));     // a queue job being saved
   if (P() && P().slug === slug) return;
   await saveNow();
   try { await loadProject(slug); } catch (e) { toast("Couldn't open that project: " + e.message); }
@@ -3351,6 +3887,9 @@ async function renameProject() {
       { method: "POST", body: { name, base: P().saved_at } });
   } catch (e) { toast(e.message); return; }
   const old = P().slug;
+  for (const j of Q.jobs) if (j.slug === old) { j.slug = res.slug; j.name = name; }
+  for (const g of Object.values(Q.groups)) if (g.slug === old) g.slug = res.slug;
+  saveQueue();
   await loadProject(res.slug);
   await refreshProjects();
   renderHeader();
@@ -3462,6 +4001,10 @@ async function confirmDelete() {
   try {
     await api("/longshot/projects/" + slug + (q.length ? "?" + q.join("&") : ""), { method: "DELETE" });
   } catch (e) { toast("Couldn't delete: " + e.message); return; }
+  // its waiting jobs can't run any more
+  for (const j of Q.jobs) if (j.slug === slug && j.state === "waiting") { j.state = "skipped"; j.error = "Its project was deleted."; }
+  saveQueue();
+  renderQueue();
   $("modal").hidden = true;
   await refreshProjects();
   const next = S.projects[0];
@@ -3710,6 +4253,8 @@ function dropTargetOf(e) {
   }
   const audio = e.target.closest("#audio-panel");
   if (audio) return { zone: "audio", el: audio, id: null };
+  const slot = e.target.closest("[data-anchor]");
+  if (slot) return { zone: "anchor", el: slot, id: slot.dataset.anchor };
   const shots = e.target.closest("#shots-panel");
   if (shots) {
     const card = e.target.closest("[data-shot]");
@@ -3750,6 +4295,7 @@ window.addEventListener("drop", (e) => {
   if (t.zone === "cast") addImages(e.dataTransfer.files, t.id);
   else if (t.zone === "audio") addAudio(e.dataTransfer.files);
   else if (t.zone === "shots") addClipFiles(e.dataTransfer.files, t.id);
+  else if (t.zone === "anchor") anchorUpload(t.id, e.dataTransfer.files);
 });
 
 async function clearSegments() {
@@ -4421,7 +4967,10 @@ async function addClipFiles(fileList, nearId, replace, atIndex) {
   const p = P();
   const f = [...fileList].find((x) => VIDEO_RE.test(x.name || ""));
   if (!f) { toast("Drop a video file (MP4, MOV, WebM, MKV) to add a clip."); return; }
-  if (busyGuard()) return;
+  {
+    const near = nearId ? P().shots.findIndex((x) => x.id === nearId) : -1;
+    if (listGuard(atIndex !== undefined ? atIndex : near < 0 ? P().shots.length : near + (replace ? 0 : 1), 1)) return;
+  }
   S.uploading.clip = true;
   toast(`Uploading ${f.name}…`);
   let info;
@@ -4431,6 +4980,7 @@ async function addClipFiles(fileList, nearId, replace, atIndex) {
   await loadInputs();
   const near = nearId ? p.shots.findIndex((x) => x.id === nearId) : -1;
   const at = atIndex !== undefined ? atIndex : near < 0 ? p.shots.length : near + (replace ? 0 : 1);
+  if (listGuard(at, 1)) return;
   await insertClip(at, info, replace && near >= 0 ? p.shots[near] : null);
 }
 
@@ -4461,7 +5011,8 @@ async function insertClip(at, info, replacing) {
 }
 
 function pickClip(nearId, replace, before) {
-  if (busyGuard()) return;
+  const near = nearId ? P().shots.findIndex((x) => x.id === nearId) : -1;
+  if (listGuard(before ? 0 : near < 0 ? P().shots.length : near + (replace ? 0 : 1), 1)) return;
   const inp = document.createElement("input");
   inp.type = "file";
   inp.accept = "video/*,.mkv,.webm,.mov";
@@ -4475,7 +5026,7 @@ function pickClip(nearId, replace, before) {
 
 /** Upload a different video for an existing clip card. */
 function pickClipFile(s) {
-  if (!s || busyGuard()) return;
+  if (!s || listGuard(P().shots.indexOf(s), 1)) return;
   const inp = document.createElement("input");
   inp.type = "file";
   inp.accept = "video/*,.mkv,.webm,.mov";
@@ -4513,7 +5064,7 @@ function clipChanged(s) {
 }
 
 function toggleJoin(s) {
-  if (!s || busyGuard()) return;
+  if (!s || listGuard(P().shots.indexOf(s))) return;
   const act = active();
   const prev = act[act.indexOf(s) - 1];
   if (!prev || (prev.kind === "clip" && s.kind === "clip")) return;
@@ -4571,7 +5122,7 @@ function clipCardBody(s, title) {
 // ---------------------------------------------------------------------------
 
 function insertShot(at) {
-  if (busyGuard()) return;
+  if (listGuard(at)) return;
   const p = P();
   const s = { id: uid("s"), text: "", seconds: 5, shot_seed: -1, bypassed: false, status: "queued",
     was_approved: false, join: "bridge", take: null, window: null, take_seconds: null, prev_seeds: [] };
@@ -4604,7 +5155,7 @@ function takeNav(s) {
   if (!list) { fetchTakes(s.id); return ""; }
   if (list.length < 2) return "";
   const i = list.findIndex((t) => t.name === s.take);
-  const off = !!S.busy;
+  const off = takesLocked(s);
   return `<span class="take-nav" data-shot="${esc(s.id)}">
     <button class="icon" data-action="take-step" data-dir="-1" aria-label="Previous take"${i <= 0 || off ? " disabled" : ""}>◀</button>
     <button class="take-label" data-action="takes" title="All takes of ${esc(titleOf(s))}">Take ${i + 1} of ${list.length}</button>
@@ -4621,7 +5172,7 @@ function stepTake(s, dir) {
 
 /** Switching takes is instant: the take is a file, so nothing samples. */
 function useTake(s, name) {
-  if (!s || busyGuard()) return;
+  if (!s || listGuard(P().shots.indexOf(s), 1)) return;
   const t = (S.takes[s.id] || []).find((x) => x.name === name);
   if (!t) return;
   s.take = t.name;
@@ -4634,7 +5185,8 @@ function useTake(s, name) {
   if (s.status === "queued") s.status = "review";
   S.dry = null;
   commit();               // the timeline swaps in that take's clip; nothing is decoded
-  ensureClips();          // a take from before 0.6.5 gets its clip now
+  // a take without a clip (made before 0.6.5, or its clip was deleted): just that one
+  if (!S.clips[takeStem(s.take)] && !S.busy && !S.chunking && !waitingJobs().length) makeClips([{ take: s.take }]);
 }
 
 function manageTakes(s) {
@@ -4695,77 +5247,51 @@ function rippleAfter(s) {
 /** "↯ hard cut · Bridge": re-render this Shot in place, pinned to the Shot now
  *  before it and to its own old ending, so the Shots after it stay. */
 function bridgeShot(s) {
-  if (!s || busyGuard()) return;
+  if (!s || inRenderGuard(s)) return;
+  if (jobFor(s.id)) { toast(`${titleOf(s)} is already in the queue.`); return; }
   rememberTake(s);
   s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
   s.status = "queued";
   s.was_approved = false;
   S.dry = null;
-  render();
-  queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Bridging into ${titleOf(s)}`,
-    note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) });
+  enqueue({ type: "shot", target: s.id, kind: "reroll", mode: "pinned" });
 }
 
 async function rerollShot(s) {
-  if (!s || busyGuard()) return;
+  if (!s || inRenderGuard(s)) return;
+  if (jobFor(s.id)) { toast(`${titleOf(s)} is already in the queue.`); return; }
   let alone = false;
   if (s.standalone) {
     const mode = await askStandalone(s, "Reroll");
-    if (!mode || S.busy) return;
+    if (!mode) return;
     alone = mode === "alone";
   }
   const takes = await askMulti(titleOf(s));
-  if (!takes || S.busy) return;
-  const ids = [s.id];
-  if (s.standalone && !alone) {
-    // pinned in place to the rendered Shots around it; it stops being standalone
-    rememberTake(s);
-    s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
-    s.status = "queued";
-    s.was_approved = false;
-    S.dry = null;
-    render();
-    const pin = pinnedNote(s);
-    multiGo(takes, ids, () => queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${numOf(s.id)} · ${pin} · seed ${s.shot_seed}`,
-      note: "In place · the Shots around it keep their takes", onDone: onRendered(s.id) }));
-    return;
-  }
-  if (s.standalone) {
-    rememberTake(s);
-    s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
-    s.status = "queued";
-    s.was_approved = false;
-    S.dry = null;
-    render();
-    multiGo(takes, ids, () => queue({ upto: s.id, kind: "reroll", standalone: true, label: `Re-rolling Shot ${numOf(s.id)} on its own · seed ${s.shot_seed}`,
-      note: "A fresh start · no pins to the Shots around it", onDone: onRendered(s.id, true) }));
-    return;
-  }
-  const after = renderedAfter(s);
-  if (after.length) {
-    const a = numOf(after[0].id), z = numOf(after[after.length - 1].id);
-    const range = after.length > 1 ? `Shots ${a}–${z}` : `Shot ${a}`;
-    const ans = await confirmBox({ title: `Reroll ${titleOf(s)} in place?`,
-      body: `${titleOf(s)} gets a new take with the same length, pinned to the Shot before it and ` +
-        `to ${range}, which stay exactly as they are. One render.`,
-      yes: `Reroll ${titleOf(s)}`, no: "Cancel", check: `Also re-render ${range}` });
-    if (!ans.ok) return;
-    if (ans.checked) rippleAfter(s);
+  if (!takes || inRenderGuard(s)) return;
+  if (!s.standalone) {
+    const after = renderedAfter(s);
+    if (after.length) {
+      const a = numOf(after[0].id), z = numOf(after[after.length - 1].id);
+      const range = after.length > 1 ? `Shots ${a}–${z}` : `Shot ${a}`;
+      const ans = await confirmBox({ title: `Reroll ${titleOf(s)} in place?`,
+        body: `${titleOf(s)} gets a new take with the same length, pinned to the Shot before it and ` +
+          `to ${range}, which stay exactly as they are. One render.`,
+        yes: `Reroll ${titleOf(s)}`, no: "Cancel", check: `Also re-render ${range}` });
+      if (!ans.ok) return;
+      if (ans.checked) rippleAfter(s);
+    }
   }
   rememberTake(s);
   s.shot_seed = Math.floor(Math.random() * (SEED_MAX + 1));
   s.status = "queued";
   s.was_approved = false;
   S.dry = null;
-  const n = numOf(s.id);
-  render();
-  multiGo(takes, ids, () => queue({ upto: s.id, kind: "reroll", trimLeft: true, label: `Re-rolling Shot ${n} · seed ${s.shot_seed}`,
-    note: renderedAfter(s).length ? "In place · the Shots around it keep their takes" : "",
-    onDone: onRendered(s.id) }));
+  // standalone pinned: in place, and it stops being standalone; on its own: a fresh start
+  enqueue({ type: "shot", target: s.id, kind: "reroll", mode: alone ? "alone" : "pinned" }, takes);
 }
 
 function useSeed(s, seed) {
-  if (!s || busyGuard() || !Number.isFinite(seed)) return;
+  if (!s || shotGuard(s) || !Number.isFinite(seed)) return;
   rememberTake(s);
   s.shot_seed = seed;
   editInPlace(s, "shot_seed");
@@ -4783,11 +5309,19 @@ function finalState() {
 }
 
 function upscaleFinal() {
+  if (!active().length) return;
+  if (Q.jobs.some((j) => liveJob(j) && j.slug === P().slug && j.spec.type === "final")) { toast("Upscale final video is already in the queue."); return; }
+  scheduleSave();
+  enqueue({ type: "final" });
+}
+
+/** Upscale final video's run options, for the queue. */
+function finalOpts() {
   const act = active();
-  if (!act.length || S.busy || S.chunking) return;
+  if (!act.length) return null;
   const v = P().settings.rtx_vsr;
   const target = act[act.length - 1].id;
-  wholeQueue({ upto: target, kind: "final", final: true, label: `Upscaling final video · ${v.scale}× ${v.quality}`,
+  return { upto: target, kind: "final", final: true, label: `Upscaling final video · ${v.scale}× ${v.quality}`,
     note: "Every Shot loads its saved take; decoding, upscaling and saving",
     onDone: ({ rows, text, outputs, built }) => {
       const combine = outputs[built.nodes.combine] || {};
@@ -4803,17 +5337,15 @@ function upscaleFinal() {
         size: [built.width, built.height], source_at, video_plan: rows, video_chain: built.chain });
       loadVideo(0);
       toast(`Final video saved as ${video.filename}` + (master ? ` and the ProRes master as ${master.filename}.` : "."));
-    } });
+    } };
 }
 
 function renderThrough() {
   const t = throughTarget();
-  if (!t || S.busy) return;
+  if (!t || jobFor(t.id)) return;
   const rv = reviewShot();
   if (rv) { rv.status = "approved"; rv.was_approved = rv.was_rendered = false; }
-  const n = numOf(t.id);
-  queue({ upto: t.id, kind: "render", label: `Re-rendering through Shot ${n}`,
-    note: "Kept takes re-continue with their own seeds", onDone: onRendered(t.id) });
+  enqueue({ type: "through", target: t.id, kind: "render", mode: "chain" });
 }
 
 // ---------------------------------------------------------------------------
@@ -4857,7 +5389,9 @@ async function afterRestart() {
   try { S.opts = await api("/longshot/options"); } catch (e) { /* keep old lists */ }
   if (P()) { await Promise.all([loadInputs(), checkInputs(), loadSegStats()]); }
   render();
-  toast("ComfyUI restarted.");
+  toast(S.autoRestart ? "ComfyUI restarted after running out of memory. The queue goes on." : "ComfyUI restarted.");
+  S.autoRestart = false;
+  setTimeout(queueNext, 500);
   autoCheck();
 }
 
@@ -4865,7 +5399,27 @@ async function afterRestart() {
 // Start
 // ---------------------------------------------------------------------------
 
+// While a queue job's project is swapped in, nothing of it is drawn and no
+// message pops up: the open project stays on screen as it was.
+for (const name of ["render", "renderShots", "renderDecision", "renderViewer", "renderSettings", "renderAdvanced",
+  "renderPlan", "renderCast", "renderStyle", "renderAudio", "renderHeader", "renderSaveState", "loadVideo",
+  "layoutStage", "toast", "showModal"]) {
+  const f = window[name];
+  if (typeof f !== "function") continue;
+  window[name] = function (...args) { if (S.swapped) return undefined; return f.apply(this, args); };
+}
+
 async function init() {
+  loadQueue();
+  renderQueue();
+  try { await start(); } finally {
+    S.ready = true;
+    renderQueue();
+    queueNext();
+  }
+}
+
+async function start() {
   connect();
   try {
     const caps = await api("/longshot/capabilities");
@@ -4890,3 +5444,4 @@ async function init() {
 }
 
 init();
+applyFolds();

@@ -20,7 +20,7 @@ import tempfile
 import time
 
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-STUDIO_VERSION = "0.6.15"
+STUDIO_VERSION = "0.7.3"
 AUDIO_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv", "m4v", "avi"}
@@ -1183,6 +1183,12 @@ def _refs(project):
         clip = sh.get("clip")
         if isinstance(clip, dict) and clip.get("file"):
             out.append((f"clip:{sh.get('id')}", clip, "file"))
+        anchor = sh.get("anchor_in")             # frame anchor at the start of this Shot
+        if isinstance(anchor, dict) and anchor.get("file"):
+            out.append((f"anchor:{sh.get('id')}", anchor, "file"))
+    end = project.get("anchor_end")              # frame anchor after the last Shot
+    if isinstance(end, dict) and end.get("file"):
+        out.append(("anchor:end", end, "file"))
     return out
 
 

@@ -128,8 +128,8 @@
         <input type="range" id="scrub" aria-label="Scrub" min="0" max="0" step="0.01" value="0">
         <div id="tl-strip" class="tl-strip" aria-label="Timeline: one block per Shot"></div>
         <div id="tl-approx" class="tl-approx" hidden>
-          <span title="Takes that were never rendered side by side are shown from the renders that made them, so the joins between them can jump slightly.">Approximate joins</span>
-          · <button class="linkbtn" data-action="update-preview" id="tl-update" title="Decode every rendered Shot together for the exact video. Nothing is sampled.">Update preview</button>
+          <span id="tl-approx-main"><span title="Takes that were never rendered side by side are shown from the renders that made them, so the joins between them can jump slightly.">Approximate joins</span>
+          · <button class="linkbtn" data-action="update-preview" id="tl-update" title="Decode every rendered Shot together for the exact video. Nothing is sampled.">Update preview</button></span>
           <button class="linkbtn" data-action="make-clips" id="tl-make" hidden title="Takes in Take history that have no clip yet: decode each on its own (nothing is sampled)."></button>
         </div>
         <div id="tl-export" class="tl-approx tl-export" hidden>
@@ -197,10 +197,21 @@
 
     <div class="panel" id="plan-panel">
       <div class="panel-head">
-        <h2>Plan</h2>
+        <h2><button class="fold" data-action="fold" data-fold="plan" aria-expanded="true" title="Show only one line"><span class="fold-ch" aria-hidden="true">▾</span>Plan</button></h2>
         <button class="ghost sm" data-action="dry-run" id="dry-btn">Dry run · full prompts</button>
       </div>
       <div id="plan" class="plan"></div>
+    </div>
+
+    <div class="panel" id="queue-panel">
+      <div class="panel-head">
+        <h2><button class="fold" data-action="fold" data-fold="queue" aria-expanded="true" title="Show only one line"><span class="fold-ch" aria-hidden="true">▾</span>Queue</button> <span class="muted small q-count" id="queue-count"></span></h2>
+        <span class="q-btns">
+          <button class="ghost sm" data-action="queue-pause" id="queue-pause" title="Finish the job that's running, then hold the rest">Pause</button>
+          <button class="ghost sm" data-action="queue-clear" id="queue-clear" title="Remove finished, failed and stopped jobs from the list">Clear finished</button>
+        </span>
+      </div>
+      <div id="queue" class="queue" aria-live="polite"></div>
     </div>
   </aside>
 </main>

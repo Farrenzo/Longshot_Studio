@@ -1,11 +1,74 @@
 # H3 Long Shot Studio
 
-## What's new in 0.6.15
+## What's new in 0.7.3
 
-Needs H3 Long Shot **1.6.5 or later** (its Take node, up to 64 Shots, and the Upscale Chunk and
-Save Audio nodes the chunked upscale uses). Replace both
+Needs H3 Long Shot **1.6.7 or later** (its Take node, up to 64 Shots, the Upscale Chunk and Save Audio
+nodes the chunked upscale uses, and frame anchors). Replace both
 folders, restart ComfyUI, then hard-refresh the Studio tab. The version shows next to the
 title in the top bar.
+
+**Render queue** (panel under Plan)
+- Every render goes into the **queue** and runs in order: ▶ on a Shot, Reroll, Render all,
+  Render odd Shots, Multi-take, Re-render through, Bridge, Update preview, Upscale final video
+  and the upscaled Export. With nothing running, it starts right away, as before.
+- **Any project, any time:** while the queue runs you can open other projects, edit them and
+  queue their Shots. Each job renders from its own project and its result (takes, clips,
+  videos, review state) goes into **that** project's files, whether it's open or not. Only
+  the project whose job is running is locked while it renders.
+- Each row: **project · Shot 05 · take 3** (Multi-take: "take 1 of 3"), with its progress
+  while it runs, then done / failed (with the error) / stopped. Click the project name to
+  open it. Waiting jobs can be moved up or down (▲ ▼) and removed; failed or stopped ones can
+  run again (↻). **Pause** finishes the running job and holds the rest; **Clear finished**
+  tidies the list. **Stop** stops the running job only; the queue goes on.
+- Multi-take and Render odd Shots appear as one row per take / Shot.
+- **Overnight:** a failed job is marked failed and the queue moves on. **Out of memory:** the
+  Studio restarts ComfyUI, waits for it and runs that job once more (segments already
+  finished are reused); a second out-of-memory marks it failed and the queue goes on. If
+  ComfyUI is closed or crashes, the queue waits ("waits for ComfyUI") and carries on when
+  it's back. The queue is kept in this browser: closing or reloading the tab and opening the
+  Studio again picks it up (a job that was running starts again; finished segments are
+  reused). The tab has to be open for the queue to run.
+
+**Frame anchors** (the Anchors column, left of the Shots)
+- An optional image at each join: before Shot 1 (its first frame), between two Shots (the
+  last frame of one and the first of the next), and after the last Shot. Each join has a tile
+  in the **Anchors** column, sitting on the line between the two cards; it follows the cards
+  as they open and close.
+- Empty tile: **+** uploads an image (or drop one on it). Set tile: shows the picture; hover
+  for **⇄** (choose a file from the input folder) and **×** (remove). Hover the tile for which
+  `<Picture N>` it is on each side. They're separate from Cast & Scenes: each anchor goes only to the
+  two Shots touching that join, as their next `<Picture N>` after the Cast pictures.
+- The Shot is pinned to start from / end on the image, and the Studio adds "The shot begins
+  from <Picture N>." / "The shot ends on <Picture N>." to the prompt it sends (your text is
+  unchanged). A Shot continuing from a rendered Shot before it starts from that Shot's real
+  frames instead (which already end on the image), so the join stays smooth.
+- Changing an anchor asks to re-render the two Shots touching it, or keep their takes.
+- No anchor next to a Clip Shot (the clip's own frames anchor that join).
+
+**Plan and Queue fold to one line**
+- Click **▸ Plan** or **▸ Queue** to fold the panel down to one line; click again to open it.
+  Folded, the Plan shows the Shot rendering (or the next one to render) and the Queue shows
+  the job running (or the next one waiting). Their buttons stay visible. Remembered in this
+  browser.
+
+**Fixes**
+- With frame anchors on, "Add shot before Shot 1" lines up with the Shot cards instead of
+  running into the Anchors column.
+- While a project renders, you can keep working on it after the part that's rendering: add
+  Shots (Add Shot, ⊕ Shot after, clips), write them, bypass or remove them, and queue them
+  (▶, Render all, Render odd Shots). They render after the current job, continuing from it.
+  Only the Shots in the running render (up to the one it renders) wait. A Shot you're writing
+  stays open when the render lands. Render all / Render odd Shots count only Shots not
+  already in the queue.
+- Multi-take seeds count up: take 2 of a Shot uses take 1's seed + 1, take 3 + 2 and so on,
+  so no two takes repeat (they used to be drawn at random).
+- Edit reference: the yellow focus outline is visible on all sides of the fields again.
+- Timeline clips are never made on their own any more. Opening a project whose clips are
+  missing (deleted, or takes from before 0.6.5) used to decode every one of them straight
+  away, which looked like a batch of renders. Now the timeline offers **Make N missing
+  clips** (decode only, nothing is sampled) and you click it when you want them. A render's
+  own new takes still get their clips as part of the render, and switching to a take that
+  has no clip makes just that one.
 
 **Every take has its own clip; the film is stitched and decoded only at the end**
 - A render samples the new Shot in its place in the chain (pinned to its neighbours, as
@@ -15,9 +78,9 @@ title in the top bar.
 - **Update preview** and **Upscale final video** take every Shot's take, stitch them in
   latent space and decode the whole film once (exact joins). The final no longer needs
   an Update preview first.
-- Takes made before 0.6.5 get their clip by themselves when they show on the timeline
-  (each decoded on its own, nothing sampled). **Make clips for N older takes** under the
-  timeline does the whole take history.
+- Takes without a clip (made before 0.6.5, or their clip was deleted) get one when you click
+  **Make N missing clips** under the timeline (each decoded on its own, nothing sampled).
+  **Make clips for N older takes** does the whole take history.
 
 **Timeline viewer**
 - **Full screen** shows the video centred on the whole screen. The control bar and review
@@ -250,7 +313,7 @@ Timeline Shot nodes) and queues it on ComfyUI.
 | Pack | Needed for |
 |---|---|
 | [H3 Prompt Compiler](https://github.com/r34vtraining/H3_Prompt_Compiler) | Shot, Subject, Ref Prompt Builder r2v (always) |
-| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.6.5 or later** | rendering; adds the timeline mode (takes, locks, pins), Clip Shots, and the Take, Upscale Chunk and Save Audio nodes the Studio uses (always) |
+| [H3 Long Shot](https://github.com/r34vtraining/H3_Longshot) **1.6.7 or later** | rendering; adds the timeline mode (takes, locks, pins), Clip Shots, and the Take, Upscale Chunk and Save Audio nodes the Studio uses (always) |
 | [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | resizing references, optional Sage attention (always) |
 | [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) | saving the video, loading audio (always) |
 | [ComfyUI-MiniMax-H3-Turbo](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo) | only when Turbo is on |

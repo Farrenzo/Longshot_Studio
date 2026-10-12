@@ -210,6 +210,30 @@ def active_shots(project: dict) -> list:
     return [s for s in project.get("shots") or [] if not s.get("bypassed")]
 
 
+def _anchor_file(item):
+    return item if isinstance(item, dict) and item.get("file") else None
+
+
+def frame_anchors(project: dict, shot: dict):
+    """(start image, end image) of a generated Shot: the frame anchor at the join
+    before it (kept on the Shot as anchor_in) and at the join after it (the next
+    active Shot's anchor_in, or the project's anchor_end after the last one).
+    No anchor next to a clip: the clip's own frames anchor that join."""
+    act = active_shots(project)
+    ids = [s.get("id") for s in act]
+    if shot.get("kind") == "clip" or shot.get("id") not in ids:
+        return None, None
+    i = ids.index(shot.get("id"))
+    prev = act[i - 1] if i else None
+    nxt = act[i + 1] if i + 1 < len(act) else None
+    start = None if prev is not None and prev.get("kind") == "clip" else _anchor_file(shot.get("anchor_in"))
+    if nxt is None:
+        end = _anchor_file(project.get("anchor_end"))
+    else:
+        end = None if nxt.get("kind") == "clip" else _anchor_file(nxt.get("anchor_in"))
+    return start, end
+
+
 def chain_upto(project: dict, upto=None) -> list:
     """Active Shots up to and including `upto` (a shot id). None = all."""
     shots = active_shots(project)
@@ -605,10 +629,34 @@ def build_prompt(project: dict, *, upto=None, dry_run: bool = False,
         frames = int(frames) if isinstance(frames, (int, float)) and frames > 0 and \
             int(frames) % 17 == 5 else 0
         join = shot.get("join") if shot.get("join") in ("bridge", "cut") else "bridge"
+        text = shot.get("text", "")
+        anchor_inputs = {}
+        if not lock:
+            # Frame anchors (Long Shot 1.6.7): the image at the join before this Shot and
+            # the one after it. Each is this Shot's next <Picture N>, after the Cast.
+            a0, a1 = frame_anchors(project, shot)
+            pic = len(cast)
+            lead, tail = "", ""
+            for key, item in (("start_image", a0), ("end_image", a1)):
+                if not item:
+                    continue
+                pic += 1
+                try:
+                    image = pj.input_path_value(item["file"], item.get("subfolder", ""))
+                except ValueError as err:
+                    raise BuildError(f"Shot {n}'s frame anchor: {err}") from None
+                anchor_inputs[key] = g.add(f"anchor{n}{key[0]}", "LoadImage",
+                                           f"Shot {n} {'start' if key[0] == 's' else 'end'} frame",
+                                           image=image)
+                if key == "start_image":
+                    lead = f"The shot begins from <Picture {pic}>. "
+                else:
+                    tail = f" The shot ends on <Picture {pic}>."
+            text = (lead + text + tail).strip()
         inputs = dict(shot_id=str(shot.get("id") or f"shot{n}"), seconds=seconds,
-                      text=shot.get("text", ""),
+                      text=text,
                       shot_seed=_seed(shot.get("shot_seed", -1), f"Shot {n} seed"),
-                      lock=lock, join=join, frames=frames)
+                      lock=lock, join=join, frames=frames, **anchor_inputs)
         if shots is not None:
             inputs["shots"] = shots
         shots = g.add(f"shot{n}", "MiniMaxH3TimelineShot", f"[Shot {n}]", **inputs)
